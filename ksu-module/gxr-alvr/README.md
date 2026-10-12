@@ -9,22 +9,38 @@ the **VRCFT-ALVR-UE** VRCFT module.
 
 1. Install the module zip in the KernelSU Manager and reboot.
 2. Done — **no PC-side setup and no IP to type.** With no `pc` file the relay
-   auto-connects by sending each datagram to the **Wi-Fi LAN broadcast address**
-   (computed from the interface netmask). The stock VRCFT-ALVR module binds
+   auto-connects by broadcasting each datagram to **every up interface's LAN
+   broadcast address plus `255.255.255.255`**. The stock VRCFT-ALVR module binds
    `0.0.0.0:41463`, so it receives broadcast datagrams too.
 
 Requirements: the headset and PC on the same LAN; the VRCFT-ALVR module running
 on the PC. Windows Firewall must allow inbound UDP 41463 for VRCFT (the same
 rule the module already needs for unicast).
 
-## Pin a specific PC (override)
+## Set the PC's IP (Manager WebUI) — use this if auto-connect is flaky
+
+Wi-Fi access points frequently filter broadcast or isolate clients, so broadcast
+does not always reach the PC. The reliable fix is to send **unicast** to the PC.
+Open **KernelSU Manager → Modules → this module → WebUI** and use the page:
+
+- **PC IP address** — the PC's IPv4 (the machine running VRCFaceTracking), then
+  tap **Save & restart relay**. Leave it empty for auto/broadcast.
+- **Test** — ping the PC from the headset to check reachability.
+- **UDP port** — defaults to 41463.
+- **TongueRoll / Verbose** — toggle the extra tongue parameter and the 1 Hz log.
+
+The page writes the module's option files (`pc`, `port`, `tongue`, `verbose`) and
+restarts the relay — no adb, no terminal. (If your Manager build has no WebUI
+button, use the by-hand method below; it writes the same files.)
+
+### Or do it by hand (root)
 
 Only needed if the PC is on a different subnet, or to avoid broadcasting to the
 whole LAN. Create `pc` (and optionally `port`) in the module directory, then
 tap the Manager **Action** button (or reboot):
 
 ```sh
-# as root (e.g. via `adb shell su` or a terminal):
+# as root (e.g. via a terminal):
 echo 192.168.1.50 > /data/adb/modules/gxr-alvr/pc
 echo 41463       > /data/adb/modules/gxr-alvr/port   # optional
 ```
@@ -35,9 +51,10 @@ Remove `pc` to go back to auto/broadcast. `port` defaults to `41463`.
 
 The Manager **Action** button runs `action.sh`: it stops the current relay
 (incl. any stale copy from an older module version) and starts it again
-immediately (no reboot). Use it after changing `pc`/`port`, or after a dev
+immediately (no reboot). Use it after changing option files, or after a dev
 binary push. **A module update does not restart the relay by itself** — tap
-**Action** (or reboot) after installing a new version.
+**Action** (or reboot) after installing a new version. The WebUI's *Save &
+restart* already does that for you.
 
 ## Monitor / A–B (optional)
 
@@ -73,6 +90,8 @@ for shipped users.)
 | `gxr_alvr` | the sender (built from `headset/gxr_alvr.c`) |
 | `service.sh` | boot / late-load start |
 | `action.sh` | Manager Action button = restart now |
+| `webui.sh` | helper for the Manager WebUI page (status / set / test) |
+| `webroot/index.html` | the Manager WebUI page (set the PC IP, status, log) |
 | `customize.sh` | installer permissions + ui_print |
 | `uninstall.sh` | stop the relay on uninstall |
 | `sepolicy.rule` | allow the KernelSU root domain to use tracefs (Enforcing) |

@@ -5,14 +5,19 @@
 //   UDP to <pc>:41463, one datagram = one record:
 //     "UniExpr\0" + 88 float UE weights + 11-float eye tail   (99 floats = 396 B)
 //
-// Destination: pass --pc <ip> for a fixed unicast target, or omit it to
-// auto-connect. In auto mode the sender computes the active interface's
-// directed broadcast address (from the Wi-Fi IPv4 netmask) and sends there.
-// The stock VRCFT-ALVR module binds 0.0.0.0:41463, so it receives it with no
-// PC-side change and no configuration. The address is re-resolved while idle,
-// so a network change (new subnet) recovers on its own. If no broadcast
-// address can be resolved yet (Wi-Fi not up at boot), the sender waits and
-// retries instead of failing.
+// Destination: pass --pc <ip> (or a comma-separated list) for fixed unicast
+// target(s), or omit it to auto-connect. In auto mode the sender sends to the
+// directed broadcast of EVERY up, broadcast-capable IPv4 interface plus the
+// limited broadcast 255.255.255.255. The stock VRCFT-ALVR module binds
+// 0.0.0.0:41463, so it receives that with no PC-side change and no
+// configuration. Fanning out to a couple of destinations covers multi-interface
+// hosts and routers that filter one form of broadcast. The set is re-resolved
+// while idle, so a network change (new subnet) recovers on its own. If no
+// broadcast address can be resolved yet (Wi-Fi not up at boot), the sender
+// waits and retries instead of failing. Broadcast is inherently unreliable
+// (AP client isolation, filtered directed broadcast), so the reliable path is
+// to pin the PC's IP -- the module's WebUI writes the `pc` file, and the
+// Sender's KernelSU Manager page is the easy way to do that.
 //
 // The 68->88 mapping (Android-XR blendshapes -> VRCFT Unified Expressions),
 // the un-clamped jaw, openness, pupil, true per-eye gaze and TongueRoll are all
@@ -54,7 +59,7 @@
 
 /* Reported in the startup log and by --version, so the running build is always
    identifiable (avoids "is the new binary actually live?" confusion). */
-#define GXR_VERSION "1.1.7"
+#define GXR_VERSION "1.2.1"
 
 #define TRACE "/sys/kernel/tracing"
 #define EYE_PLUGIN "/vendor/lib64/libperception_eye_tracking_host_plugin.so"
@@ -116,7 +121,9 @@ static float PUPIL_DILATION_GAIN = 0.75f; /* widens the min/max window by 1/gain
 static float PUPIL_MIN_CONF = 0.25f;      /* ignore detections below this confidence (v4) */
 static float PUPIL_OPEN_GATE = 0.6f;      /* min/max window moves only while both eyes are this open */
 static float PUPIL_MAX_JUMP = 1.0f;       /* reject a detection this far (mm) from the running value = closed-eye junk */
+static float PUPIL_RELOCK_MS = 1500.0f;   /* if nothing has been accepted for this long, accept the fresh reading (never lock out) */
 #define PUPIL_WINDOW_MIN_MM 0.05f  /* floor for the tracked min/max span */
+#define PUPIL_WINDOW_MARGIN 0.01f  /* emitted window is forced to contain the pupil by >= this (mm) */
 #define PUPIL_GAIN_MIN 0.05f       /* floor on the dilation gain divisor */
 #define PUPIL_DET_FRESH_MS 250     /* a detection older than this is stale */
 #define PUPIL_MIN_MM 1.0f          /* plausible pupil-diameter band (reject junk) */
@@ -433,67 +440,103 @@ static int parse_tongue(const char *line, float v[TONGUE_N]) {
 
 /* ---------------- sender ---------------- */
 static int g_sock = -1;
-static struct sockaddr_in g_sa;
-static int g_auto_target = 0;    /* 1 = resolve the Wi-Fi directed broadcast */
-static int g_have_target = 0;    /* a valid destination has been set */
-static int g_have_mirror = 0;    /* optional second target (a monitor tool) */
+#define MAX_TARGETS 8
+static struct sockaddr_in g_targets[MAX_TARGETS];
+static int g_ntargets = 0;         /* resolved destinations (auto, or a --pc list) */
+static int g_auto_target = 0;      /* 1 = resolve LAN broadcast targets itself */
+static uint16_t g_sa_port = 0;     /* network-order target port */
+static int g_have_mirror = 0;      /* optional second target (a monitor tool) */
 static struct sockaddr_in g_mirror_sa;
 
 static void put_f32(unsigned char *p, float f) { memcpy(p, &f, 4); }
 
-/* Directed broadcast of the active IPv4 interface. Prefer a Wi-Fi interface
-   (wlan*), else the first up, non-loopback, broadcast-capable one. Returns 0
-   and fills *out on success. */
-static int resolve_broadcast(struct in_addr *out) {
+/* Append a destination (deduped). Returns 1 if added, 0 if a duplicate/overflow. */
+static int add_target(const struct in_addr *ip) {
+    for (int i = 0; i < g_ntargets; i++)
+        if (g_targets[i].sin_addr.s_addr == ip->s_addr) return 0;
+    if (g_ntargets >= MAX_TARGETS) return 0;
+    memset(&g_targets[g_ntargets], 0, sizeof(g_targets[0]));
+    g_targets[g_ntargets].sin_family = AF_INET;
+    g_targets[g_ntargets].sin_port = g_sa_port;
+    g_targets[g_ntargets].sin_addr = *ip;
+    g_ntargets++;
+    return 1;
+}
+
+static void target_list(char *s, size_t n) {
+    s[0] = '\0';
+    for (int i = 0; i < g_ntargets; i++) {
+        char one[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &g_targets[i].sin_addr, one, sizeof(one));
+        if (i) strncat(s, ",", n - strlen(s) - 1);
+        strncat(s, one, n - strlen(s) - 1);
+    }
+}
+
+/* Resolve the auto target(s): the directed broadcast of every up,
+   broadcast-capable IPv4 interface (wlan* first so it leads the list), then the
+   limited broadcast 255.255.255.255. Fanning out covers multi-interface hosts
+   and routers that filter one form of broadcast. Returns the count resolved. */
+static int resolve_targets(void) {
     struct ifaddrs *ifs = NULL;
-    if (getifaddrs(&ifs) != 0) return -1;
-    int rc = -1;
-    for (int pass = 0; pass < 2 && rc != 0; pass++) {
+    if (getifaddrs(&ifs) != 0) return 0;
+    for (int pass = 0; pass < 2; pass++) {
         for (struct ifaddrs *ifa = ifs; ifa; ifa = ifa->ifa_next) {
             if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
             if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_BROADCAST)) continue;
             if (!ifa->ifa_broadaddr || (ifa->ifa_flags & IFF_LOOPBACK)) continue;
-            if (pass == 0 && strncmp(ifa->ifa_name, "wlan", 4) != 0) continue;
-            *out = ((struct sockaddr_in *)ifa->ifa_broadaddr)->sin_addr;
-            rc = 0;
-            break;
+            int iswlan = strncmp(ifa->ifa_name, "wlan", 4) == 0;
+            if ((pass == 0) != iswlan) continue;
+            struct in_addr b = ((struct sockaddr_in *)ifa->ifa_broadaddr)->sin_addr;
+            add_target(&b);
         }
     }
     freeifaddrs(ifs);
-    return rc;
+    if (g_ntargets > 0) {
+        struct in_addr all; all.s_addr = htonl(INADDR_BROADCAST);   /* 255.255.255.255 */
+        add_target(&all);
+    }
+    return g_ntargets;
 }
 
-/* Set/refresh g_sa for auto mode; logs only when the address changes. If no
-   interface is resolvable yet (Wi-Fi still coming up) we keep the last good
-   address, or stay silent and retry on the next idle tick. */
+/* Set/refresh the auto target set; logs only when it changes. If no interface is
+   resolvable yet (Wi-Fi still coming up) we keep the last good set, so a network
+   change recovers instead of stalling. */
 static void refresh_target(void) {
     if (!g_auto_target) return;
-    struct in_addr b;
-    if (resolve_broadcast(&b) != 0) {
-        if (!g_have_target) {
+    struct sockaddr_in before[MAX_TARGETS];
+    int nbefore = g_ntargets;
+    memcpy(before, g_targets, sizeof(before));
+    g_ntargets = 0;
+    int n = resolve_targets();
+    if (n == 0) {
+        memcpy(g_targets, before, sizeof(before));
+        g_ntargets = nbefore;
+        if (g_ntargets == 0) {
             static int warned = 0;
             if (!warned) { warned = 1; fprintf(stderr, "gxr_alvr: no broadcast interface yet; will retry\n"); }
         }
         return;
     }
-    if (!g_have_target || b.s_addr != g_sa.sin_addr.s_addr) {
-        g_sa.sin_addr = b;
-        g_have_target = 1;
-        char s[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &b, s, sizeof(s));
-        fprintf(stderr, "gxr_alvr: auto target %s:%u (broadcast)\n", s, ntohs(g_sa.sin_port));
+    int changed = (n != nbefore);
+    for (int i = 0; !changed && i < n; i++)
+        if (g_targets[i].sin_addr.s_addr != before[i].sin_addr.s_addr) changed = 1;
+    if (changed) {
+        char s[256]; target_list(s, sizeof(s));
+        fprintf(stderr, "gxr_alvr: auto target(s) %s:%u (broadcast)\n", s, ntohs(g_sa_port));
     }
 }
 
 static void send_uniexpr(const float *ue, const float *tail) {
-    if (!g_have_target) return;   /* fail soft until a destination is known */
+    if (g_ntargets == 0) return;   /* fail soft until a destination is known */
     unsigned char buf[8 + PAYLOAD_N * 4];
     memcpy(buf, "UniExpr\0", 8);
     for (int i = 0; i < UE_MAX; i++) put_f32(buf + 8 + i * 4, ue[i]);
     for (int i = 0; i < TAIL_N; i++) put_f32(buf + 8 + (UE_MAX + i) * 4, tail[i]);
-    sendto(g_sock, buf, sizeof(buf), 0, (struct sockaddr *)&g_sa, sizeof(g_sa));
+    for (int i = 0; i < g_ntargets; i++)
+        sendto(g_sock, buf, sizeof(buf), 0, (struct sockaddr *)&g_targets[i], sizeof(g_targets[i]));
     if (g_have_mirror) {
-        g_mirror_sa.sin_addr = g_sa.sin_addr;   /* follow auto re-resolution */
+        g_mirror_sa.sin_addr = g_targets[0].sin_addr;   /* follow auto re-resolution */
         sendto(g_sock, buf, sizeof(buf), 0, (struct sockaddr *)&g_mirror_sa, sizeof(g_mirror_sa));
     }
 }
@@ -511,6 +554,7 @@ static float g_tongue[TONGUE_N]; static long long g_tongue_ms;
 static float g_minMm = 1e30f, g_maxMm = -1e30f;
 static int g_have_pupil = 0;
 static float g_lastMm = 0.0f, g_lastMin = 0.0f, g_lastMax = 0.0f;
+static long long g_pupilAcceptMs;   /* last frame a pupil reading was accepted */
 /* jaw neutral learning (see RootedLinkFTModule.UpdateJaw) */
 static float g_jawHist[JAW_HIST]; static int g_jawN, g_jawIdx; static float g_jawNeutral = 0.2f;
 static long long g_jawNeutralMs;
@@ -600,41 +644,59 @@ static void compute_and_send(void) {
         tail[T_ROpen] = 1.0f - clampf(closedR + closedR * ue[UE_EyeSquintRight], 0.0f, 1.0f);
     }
 
-    /* 3b) pupil: robust to winks. Only fresh, confident detections count; the
-       tracked min/max window only moves while BOTH eyes are open, so a wink's
-       junk detection can't corrupt it; and the last good reading is held (never
-       zeroed) if a frame has none -- a 0/0 window makes VRCFT's dilation
-       normalize degenerately. */
+    /* 3b) pupil: robust to blinks/winks. The reading AND the tracked min/max
+       window only update while BOTH eyes are open, so a blink's degenerate
+       ellipse can never corrupt either. (The old code let a closed-eye detection
+       that passed the jump threshold drag the reading below the window, which
+       made VRCFT's (mm-min)/(max-min) latch at exactly 0 until the eyes
+       reopened -- the "dilation stuck at 0 after blinking" report.) If a frame
+       has no usable reading we hold the last good value -- never emit 0. Because
+       the reading and the envelope now move together, the emitted window always
+       contains the emitted pupil; the margin clamp below is belt-and-suspenders. */
+    int eyesOpen = !haveFace ||
+        ((tail[T_LOpen] >= PUPIL_OPEN_GATE) && (tail[T_ROpen] >= PUPIL_OPEN_GATE));
+    int seed = (!eyesOpen && !g_have_pupil);   /* bootstrap even if the gate is not met yet */
     float mm = 0.0f; int nd = 0;
-    for (int i = 0; i < MAX_DET; i++) {
-        if (!g_det_ok[i] || (now - g_det_ms[i]) > PUPIL_DET_FRESH_MS) continue;
-        if (g_det_conf[i] < PUPIL_MIN_CONF) continue;
-        float d = clampf(2.0f * fmaxf(g_det[i][2], g_det[i][3]) * PUPIL_MM_SCALE,
-                         PUPIL_MIN_MM, PUPIL_MAX_MM);
-        /* A closed eye (wink) yields a degenerate ellipse whose diameter is far
-           from the live pupil -- reject it so it can't drag the average (and
-           hence VRCFT's dilation) toward 0. Real dilation changes slowly. */
-        if (g_have_pupil && fabsf(d - g_lastMm) > PUPIL_MAX_JUMP) continue;
-        mm += d; nd++;
+    if (eyesOpen || seed) {
+        for (int i = 0; i < MAX_DET; i++) {
+            if (!g_det_ok[i] || (now - g_det_ms[i]) > PUPIL_DET_FRESH_MS) continue;
+            if (g_det_conf[i] < PUPIL_MIN_CONF) continue;
+            float d = clampf(2.0f * fmaxf(g_det[i][2], g_det[i][3]) * PUPIL_MM_SCALE,
+                             PUPIL_MIN_MM, PUPIL_MAX_MM);
+            /* A closed eye (wink) yields a degenerate ellipse whose diameter is
+               far from the live pupil -- reject it so it can't drag the average.
+               But if everything has been rejected for a while the tracked value
+               is the stale one, so relock to the fresh reading (never lock out). */
+            if (g_have_pupil && fabsf(d - g_lastMm) > PUPIL_MAX_JUMP &&
+                (float)(now - g_pupilAcceptMs) < PUPIL_RELOCK_MS)
+                continue;
+            mm += d; nd++;
+        }
     }
     if (nd > 0) {
         mm /= (float)nd;
-        int eyesOpen = !haveFace ||
-            ((tail[T_LOpen] >= PUPIL_OPEN_GATE) && (tail[T_ROpen] >= PUPIL_OPEN_GATE));
-        if (eyesOpen) {
+        if (eyesOpen || seed) {
             if (mm < g_minMm) g_minMm = mm;
             if (mm > g_maxMm) g_maxMm = mm;
         }
-        if (g_minMm > g_maxMm) { g_minMm = g_maxMm = mm; }   /* first reading */
+        g_lastMm = mm;
+        g_pupilAcceptMs = now;
+        g_have_pupil = 1;
+    }
+    if (g_minMm > g_maxMm) { g_minMm = g_maxMm = g_lastMm; }   /* first reading */
+    if (g_have_pupil) {
         float center = 0.5f * (g_minMm + g_maxMm);
         float half = 0.5f * fmaxf(g_maxMm - g_minMm, PUPIL_WINDOW_MIN_MM);
         float wideHalf = half / fmaxf(PUPIL_DILATION_GAIN, PUPIL_GAIN_MIN);
-        g_lastMm = mm; g_lastMin = center - wideHalf; g_lastMax = center + wideHalf;
-        g_have_pupil = 1;
-    }
-    if (g_have_pupil) {
+        float lo = center - wideHalf, hi = center + wideHalf;
+        /* Never emit a window that excludes the emitted pupil: VRCFT pins
+           dilation to 0 when pupil<=min and to 1 when pupil>=max. */
+        float eps = fmaxf(PUPIL_WINDOW_MARGIN, 0.05f * (hi - lo));
+        if (lo > g_lastMm - eps) lo = g_lastMm - eps;
+        if (hi < g_lastMm + eps) hi = g_lastMm + eps;
+        g_lastMin = lo; g_lastMax = hi;
         tail[T_LPupil] = g_lastMm; tail[T_RPupil] = g_lastMm;
-        tail[T_MinDil] = g_lastMin; tail[T_MaxDil] = g_lastMax;
+        tail[T_MinDil] = lo; tail[T_MaxDil] = hi;
     }
     if (g_verbose) {
         static long long lastpup = 0;
@@ -733,7 +795,7 @@ static void feed_line(const char *line) {
 static void usage(FILE *f, const char *argv0) {
     fprintf(f,
         "Usage: %s [--pc <ip>] [--port <n>] [options]\n"
-        "  --pc <ip>            fixed unicast target (default: auto broadcast)\n"
+        "  --pc <ip[,ip..]>     fixed unicast target(s) (default: auto broadcast)\n"
         "  --port <n>           UDP target port (default 41463)\n"
         "  --verbose            log the 1 Hz gaze trace for tuning\n"
         "  --gaze-swap 0|1      swap gaze axes (default 0)\n"
@@ -747,6 +809,7 @@ static void usage(FILE *f, const char *argv0) {
         "  --mirror-port <n>    also send a copy to <target>:<n> (for a monitor)\n"
         "  --pupil-mm-scale <f> --pupil-dilation-gain <f>\n"
         "  --pupil-min-conf <f> --pupil-open-gate <f> --pupil-max-jump <f>\n"
+        "  --pupil-relock-ms <f>  accept a fresh reading after this long with none (default 1500)\n"
         "  --pupil-offset <hex> --eye-dir-offset <hex>\n"
         "  --face-bs-offset <hex> --jaw-offset <hex> --tongue-offset <hex>\n"
         "  --eye-plugin <path> --face-plugin <path>\n",
@@ -776,6 +839,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pupil-min-conf") && i + 1 < argc) PUPIL_MIN_CONF = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-open-gate") && i + 1 < argc) PUPIL_OPEN_GATE = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-max-jump") && i + 1 < argc) PUPIL_MAX_JUMP = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--pupil-relock-ms") && i + 1 < argc) PUPIL_RELOCK_MS = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-offset") && i + 1 < argc) pupil_off = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--eye-dir-offset") && i + 1 < argc) eyedir_off = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--face-bs-offset") && i + 1 < argc) face_off = strtoul(argv[++i], NULL, 0);
@@ -801,24 +865,32 @@ int main(int argc, char **argv) {
     /* SO_BROADCAST is required for auto mode and harmless for unicast. */
     int bcast = 1;
     setsockopt(g_sock, SOL_SOCKET, SO_BROADCAST, &bcast, sizeof(bcast));
-    memset(&g_sa, 0, sizeof(g_sa));
-    g_sa.sin_family = AF_INET;
-    g_sa.sin_port = htons((uint16_t)port);
+    g_sa_port = htons((uint16_t)port);
 
-    char target[INET_ADDRSTRLEN + 16];
+    char target[256];
     if (pc) {
-        if (inet_pton(AF_INET, pc, &g_sa.sin_addr) != 1) {
-            fprintf(stderr, "gxr_alvr: bad --pc ip '%s'\n", pc);
-            return 2;
+        /* --pc takes a comma-separated list of IPs (one or more pinned PCs). */
+        char list[256]; snprintf(list, sizeof(list), "%s", pc);
+        char *save = NULL;
+        int bad = 0;
+        for (char *tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+            while (*tok == ' ' || *tok == '\t') tok++;
+            size_t L = strlen(tok);
+            while (L && (tok[L - 1] == ' ' || tok[L - 1] == '\t')) tok[--L] = '\0';
+            struct in_addr a;
+            if (!*tok || inet_pton(AF_INET, tok, &a) != 1) {
+                fprintf(stderr, "gxr_alvr: bad --pc ip '%s'\n", tok);
+                bad = 1; continue;
+            }
+            add_target(&a);
         }
-        g_have_target = 1;
+        if (bad || g_ntargets == 0) return 2;
         snprintf(target, sizeof(target), "%s", pc);
     } else {
         g_auto_target = 1;
         refresh_target();   /* may stay unresolved if Wi-Fi is not up yet */
-        if (g_have_target) {
-            char s[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &g_sa.sin_addr, s, sizeof(s));
+        if (g_ntargets > 0) {
+            char s[256]; target_list(s, sizeof(s));
             snprintf(target, sizeof(target), "%s", s);
         } else {
             snprintf(target, sizeof(target), "auto (unresolved)");
@@ -833,7 +905,7 @@ int main(int argc, char **argv) {
     }
 
     if (selftest) {
-        if (!g_have_target) {
+        if (g_ntargets == 0) {
             fprintf(stderr, "gxr_alvr: selftest: no target resolved (no broadcast interface)\n");
             return 1;
         }

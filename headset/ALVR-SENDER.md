@@ -22,19 +22,19 @@ The 88 weights are indexed by `VRCFaceTracking.Core.Params.Expressions.UnifiedEx
 
 (Module maps `Gaze.x <- Pitch`, `Gaze.y <- Yaw`.)
 
-## Destination: auto-connect (default) or a pinned PC
+## Destination: auto-broadcast (default) or pinned unicast
 
-- **Auto (default):** with no `--pc`, the sender find's the active interface's **directed broadcast address** (from the Wi-Fi IPv4 netmask) and sends there. The stock VRCFT-ALVR module binds `0.0.0.0:41463`, so it receives broadcast datagrams. **Zero configuration, no PC-side change**. The address is re-resolved when idle so a subnet change recovers.
-- **Pinned:** `--pc <ip>` sends unicast to that PC. The module scripts read it from the module's `pc` file (see the module README).
+- **Auto (default):** with no `--pc`, the sender sends each datagram to the **directed broadcast of every up, broadcast-capable IPv4 interface** (Wi-Fi preferred, but not required) **plus the limited broadcast `255.255.255.255`**. The stock VRCFT-ALVR module binds `0.0.0.0:41463`, so it receives broadcast datagrams. **Zero configuration, no PC-side change.** The set is re-resolved while idle so a subnet change recovers.
+- **Pinned:** `--pc <ip>` (or a comma-separated list of IPs) sends unicast to those PCs. The module scripts read a single IP from the module's `pc` file, which the **Manager WebUI** writes (see the module README).
 
-Caveats: broadcast reaches every host on the LAN (a second PC running the module would also get the packets); if the PC is on a different subnet, pick it with `--pc`/`pc`.
+Caveats: broadcast reaches every host on the LAN (a second PC running the module would also get the packets), and **many Wi-Fi access points filter broadcast or isolate clients** — that is the usual reason auto-connect "doesn't work sometimes". The reliable fix is to pin the PC's IP (via the module's Manager WebUI). If the PC is on a different subnet, you must pin it.
 
 ## What it computes (all from read-only host uprobes)
 
 - **68 → UE** (`FACE68_TO_UE`, 66 pairs) — mirrors `RootedLinkFTModule.Face68Map`.
 - **Un-clamped jaw** — `ue[JawOpen]` overridden from the pre-clamp jaw while the vendor tongue-clamp is active (ported from `RootedLinkFTModule.UpdateJaw`).
 - **Openness** — `1 - clamp(EyesClosed + EyesClosed*Squint)` per eye.
-- **Pupil** — `2*max(ellipse axes) * PUPIL_MM_SCALE (24)` over fresh, confident detections, with a tracked min/max dilation window (`PUPIL_DILATION_GAIN = 0.75`). The window only moves while both eyes are open, so a wink can't corrupt it.
+- **Pupil** — `2*max(ellipse axes) * PUPIL_MM_SCALE (24)` over fresh, confident detections, with a tracked min/max dilation window (`PUPIL_DILATION_GAIN = 0.75`). The reading **and** the window only move while **both eyes are open**, so a blink/wink can't corrupt either. If a frame has no usable reading the last good value is held (never 0). A detection far from the live value is rejected unless nothing has been accepted for `--pupil-relock-ms`, so the value can't lock out. The emitted window is forced to strictly contain the emitted pupil, because VRCFT latches dilation to 0 while `pupil <= min`. Together this fixes "dilation stuck at 0 after blinking".
 - **Gaze** — per-eye `yaw = atan2(x,z)`, `pitch = atan2(-yDown,z)` from the host DNN direction (`0x4be378`).
 - **Tongue** — the 5 basic DOFs come from the 68-vector (face 63–67). `TongueRoll` is derived from the 11-D `predicted_local_tongue_expression` (uprobe `0x358a34`) via the exact 11→5 mapper plus a DOF-leak-free calibration axis (`--tongue-extras`, default on). Shape (Flat/Squish) and Twist were dropped after live testing — the 11-D model can't separate them reliably.
 
@@ -52,7 +52,7 @@ tools/build_alvr.sh                      # -> tools/gxr_alvr
 
 ## Flags
 
-`--pc`, `--port`, `--verbose` (1 Hz gaze trace), `--gaze-swap`, `--gaze-invert-x`, `--gaze-invert-y`, `--selftest`, `--pupil-mm-scale`, `--pupil-dilation-gain`, `--pupil-offset`, `--eye-dir-offset`, `--face-bs-offset`, `--jaw-offset`, `--eye-plugin`, `--face-plugin`. 
+`--pc <ip[,ip..]>`, `--port`, `--verbose` (1 Hz gaze trace), `--gaze-swap`, `--gaze-invert-x`, `--gaze-invert-y`, `--selftest`, `--pupil-mm-scale`, `--pupil-dilation-gain`, `--pupil-min-conf`, `--pupil-open-gate`, `--pupil-max-jump`, `--pupil-relock-ms`, `--pupil-offset`, `--eye-dir-offset`, `--face-bs-offset`, `--jaw-offset`, `--eye-plugin`, `--face-plugin`. 
 Run `gxr_alvr --help` for the list.
 
 The old runtime `/data/local/tmp/gxr_alvr.conf` (`swap`/`invert_x`/`invert_y`) is **no longer polled**; the now-verified gaze mapping is the compile-time default, and the same knobs are the `--gaze-*` flags above.

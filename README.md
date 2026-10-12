@@ -60,8 +60,17 @@ The module has a prebuilt `gxr_alvr`. To rebuild it from source, copy the new bu
 
 ```sh
 cp headset/gxr_alvr ksu-module/gxr-alvr/gxr_alvr
+python tools/make_module_zip.py ksu-module/gxr-alvr gxr-alvr.zip   # any OS
+# or, on Linux/macOS:
 ( cd ksu-module/gxr-alvr && zip -r ../gxr-alvr.zip . )
 ```
+
+**Entry names must use forward slashes.** KernelSU extracts the zip on Linux, so
+a Windows tool that writes `webroot\index.html` (e.g. `ZipFile.CreateFromDirectory`
+or `Compress-Archive`) creates a *literal file with a backslash* at the module
+root instead of a `webroot/` directory — ksud then reports `web=false` and the
+module's WebUI never shows. Use `tools/make_module_zip.py` (writes `/`
+explicitly) or POSIX `zip`.
 
 The bundled binary is committed so users can install without a toolchain; if you change `headset/gxr_alvr.c`, rebuild and re-copy it.
 

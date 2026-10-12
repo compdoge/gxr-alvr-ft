@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Galaxy XR ALVR relay</title>
+<style>
+  :root { color-scheme: dark; --bg:#121212; --card:#1e1e1e; --fg:#e8e8e8; --dim:#9a9a9a;
+          --accent:#7c9cff; --ok:#5ddc8a; --warn:#ffcc66; --err:#ff7b7b; --line:#333; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
+         font:15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  h1 { font-size:18px; margin:0 0 2px; }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
+          padding:14px; margin-bottom:14px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em;
+             color:var(--dim); margin:0 0 10px; }
+  label { display:block; font-size:13px; color:var(--dim); margin:10px 0 4px; }
+  input[type=text], input[type=number] {
+     width:100%; padding:10px 12px; border-radius:9px; border:1px solid var(--line);
+     background:#0e0e0e; color:var(--fg); font-size:15px; }
+  .row { display:flex; gap:10px; align-items:center; }
+  .row input[type=text] { flex:1; }
+  .hint { color:var(--dim); font-size:12px; margin-top:4px; }
+  .check { display:flex; align-items:center; gap:9px; margin:12px 0 0; color:var(--fg); font-size:14px; }
+  .check input { width:18px; height:18px; accent-color:var(--accent); }
+  button { appearance:none; border:0; border-radius:9px; padding:11px 14px; font-size:14px;
+           font-weight:600; background:#2a2a2a; color:var(--fg); cursor:pointer; }
+  button.primary { background:var(--accent); color:#0b1020; }
+  button:disabled { opacity:.5; }
+  .btns { display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }
+  dl { margin:0; display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:13px; }
+  dt { color:var(--dim); }
+  dd { margin:0; word-break:break-word; }
+  .mono { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
+  pre { background:#0e0e0e; border:1px solid var(--line); border-radius:9px; padding:10px;
+        overflow:auto; max-height:190px; white-space:pre-wrap; word-break:break-word; margin:0;
+        font-size:11.5px; color:#bfc7d5; }
+  .status { font-weight:600; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .err { color:var(--err); }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px;
+          background:#262626; color:var(--dim); margin-left:6px; }
+</style>
+</head>
+<body>
+  <h1>Galaxy XR ALVR relay</h1>
+  <div class="sub">Headset-side sender for the VRCFT-ALVR-UE module &middot; UDP 41463</div>
+
+  <div class="card">
+    <h2>Status <span id="bridge" class="pill">connecting…</span></h2>
+    <dl>
+      <dt>Target</dt><dd id="s-armed" class="mono">—</dd>
+      <dt>Relay pid</dt><dd id="s-pid" class="mono">—</dd>
+      <dt>Headset IP</dt><dd id="s-ip" class="mono">—</dd>
+    </dl>
+  </div>
+
+  <div class="card">
+    <h2>Connection</h2>
+    <label for="pc">PC IP address</label>
+    <div class="row">
+      <input type="text" id="pc" inputmode="decimal" autocomplete="off" spellcheck="false"
+             placeholder="auto (broadcast)">
+      <button id="btn-test" title="Ping the entered IP from the headset">Test</button>
+    </div>
+    <div class="hint">Leave empty for auto-connect (LAN broadcast). If the link drops often
+      (Wi-Fi access points frequently filter broadcast), enter the PC's IPv4 address here —
+      the PC running VRCFaceTracking.</div>
+    <div id="test-result" class="hint"></div>
+
+    <label for="port">UDP port</label>
+    <input type="number" id="port" min="1" max="65535" placeholder="41463">
+
+    <div class="check"><input type="checkbox" id="tongue"><label for="tongue" style="margin:0">TongueRoll parameter</label></div>
+    <div class="check"><input type="checkbox" id="verbose"><label for="verbose" style="margin:0">Verbose logging (1 Hz trace)</label></div>
+
+    <div class="btns">
+      <button class="primary" id="btn-save">Save &amp; restart relay</button>
+      <button id="btn-refresh">Refresh</button>
+    </div>
+    <div id="save-result" class="hint"></div>
+  </div>
+
+  <div class="card">
+    <h2>Log tail</h2>
+    <pre id="s-log">—</pre>
+  </div>
+
+<script>
+"use strict";
+var MOD = "/data/adb/modules/gxr-alvr";
+var BUSY = false;
+
+function $(id) { return document.getElementById(id); }
+
+/* KernelSU module WebUI bridge (classic tiann API, same as the `kernelsu` npm
+   library): ksu.exec(command, optionsJson, callbackName), and the named global
+   is invoked with (errno, stdout, stderr). */
+function ksuExec(command) {
+  return new Promise(function (resolve) {
+    if (typeof ksu === "undefined" || !ksu || typeof ksu.exec !== "function") {
+      resolve({ errno: -1, stdout: "", stderr: "KernelSU WebUI bridge unavailable" });
+      return;
+    }
+    var name = "gxr_cb_" + Date.now() + "_" + Math.floor(Math.random() * 1e6);
+    var done = false;
+    var timer = setTimeout(function () {
+      if (done) return;
+      done = true; delete window[name];
+      resolve({ errno: -1, stdout: "", stderr: "timed out waiting for root shell" });
+    }, 15000);
+    window[name] = function (errno, stdout, stderr) {
+      if (done) return;
+      done = true; clearTimeout(timer); delete window[name];
+      resolve({ errno: Number(errno), stdout: stdout || "", stderr: stderr || "" });
+    };
+    try {
+      ksu.exec(command, JSON.stringify({ cwd: MOD }), name);
+    } catch (e) {
+      clearTimeout(timer); delete window[name];
+      resolve({ errno: -1, stdout: "", stderr: String(e) });
+    }
+  });
+}
+
+function parseKV(out) {
+  var o = {};
+  (out || "").split("\n").forEach(function (line) {
+    var i = line.indexOf("=");
+    if (i > 0) o[line.slice(0, i)] = line.slice(i + 1);
+  });
+  return o;
+}
+
+function setBusy(b) {
+  BUSY = b;
+  ["btn-save", "btn-refresh", "btn-test"].forEach(function (id) { $(id).disabled = b; });
+}
+
+function refresh() {
+  setBusy(true);
+  ksuExec("sh " + MOD + "/webui.sh status").then(function (r) {
+    if (r.errno !== 0 && !r.stdout) {
+      $("bridge").textContent = "no root bridge";
+      $("bridge").className = "pill err";
+      $("s-armed").textContent = r.stderr || "unavailable";
+      setBusy(false);
+      return;
+    }
+    $("bridge").textContent = "root ok";
+    $("bridge").className = "pill ok";
+    var s = parseKV(r.stdout);
+    if (document.activeElement !== $("pc")) $("pc").value = s.pc || "";
+    if (document.activeElement !== $("port")) $("port").value = s.port || "41463";
+    $("tongue").checked = (s.tongue !== "0");           /* file absent == on */
+    $("verbose").checked = (s.verbose === "1");
+    $("s-armed").textContent = s.armed || "(no startup line yet)";
+    $("s-pid").textContent = s.pid || "(not running)";
+    $("s-pid").className = s.pid ? "mono ok" : "mono err";
+    $("s-ip").textContent = (s.ip || "").replace(/,+$/, "") || "—";
+    $("s-log").textContent = (s.tail || "—").split("~").join("\n");
+    setBusy(false);
+  });
+}
+
+function validIP(v) {
+  if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(v)) return false;
+  return v.split(".").every(function (p) { return Number(p) <= 255; });
+}
+
+function save() {
+  if (BUSY) return;
+  var pc = $("pc").value.trim();
+  var port = $("port").value.trim() || "41463";
+  if (pc && pc.toLowerCase() !== "auto" && !validIP(pc)) {
+    $("save-result").textContent = "Enter a valid IPv4 address, or leave empty for auto.";
+    $("save-result").className = "hint err";
+    return;
+  }
+  if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+    $("save-result").textContent = "Enter a valid port (1–65535).";
+    $("save-result").className = "hint err";
+    return;
+  }
+  var pcArg = (pc === "" || pc.toLowerCase() === "auto") ? "-" : pc;
+  var cmd = "sh " + MOD + "/webui.sh set " + pcArg + " " + port + " " +
+            ($("tongue").checked ? "1" : "0") + " " + ($("verbose").checked ? "1" : "0");
+  setBusy(true);
+  $("save-result").textContent = "Applying…";
+  $("save-result").className = "hint";
+  ksuExec(cmd).then(function (r) {
+    var s = parseKV(r.stdout);
+    if (r.errno === 0 && s.ok === "1") {
+      $("save-result").textContent = "Saved. Relay restarted" + (s.pid ? " (pid " + s.pid + ")." : ".");
+      $("save-result").className = "hint ok";
+      if (typeof ksu !== "undefined" && ksu.toast) ksu.toast("Relay restarted");
+    } else {
+      $("save-result").textContent = "Failed: " + (s.error || r.stderr || ("exit " + r.errno));
+      $("save-result").className = "hint err";
+    }
+    refresh();
+  });
+}
+
+function test() {
+  if (BUSY) return;
+  var pc = $("pc").value.trim();
+  if (!validIP(pc)) {
+    $("test-result").textContent = "Enter a valid IPv4 address to test.";
+    $("test-result").className = "hint err";
+    return;
+  }
+  if (pc === "") return;
+  setBusy(true);
+  $("test-result").textContent = "Pinging " + pc + "…";
+  $("test-result").className = "hint";
+  ksuExec("sh " + MOD + "/webui.sh test " + pc).then(function (r) {
+    var s = parseKV(r.stdout);
+    if (s.ping === "ok") {
+      $("test-result").textContent = pc + " is reachable from the headset.";
+      $("test-result").className = "hint ok";
+    } else {
+      $("test-result").textContent = pc + " did not answer a ping (may still work — a PC can block ICMP).";
+      $("test-result").className = "hint warn";
+    }
+    setBusy(false);
+  });
+}
+
+document.addEventListener("DOMContentLoaded", function () {
+  $("btn-save").addEventListener("click", save);
+  $("btn-refresh").addEventListener("click", refresh);
+  $("btn-test").addEventListener("click", test);
+  refresh();
+});
+</script>
+</body>
+</html>
