@@ -9,6 +9,13 @@ PC=$(cat "$MODDIR/pc" 2>/dev/null)
 PORT=$(cat "$MODDIR/port" 2>/dev/null)
 [ -z "$PORT" ] && PORT=41463
 
+# Same optional extras as service.sh (see README.md).
+MIRROR=$(cat "$MODDIR/mirror" 2>/dev/null)
+TONGUE=$(cat "$MODDIR/tongue" 2>/dev/null)
+EXTRA=""
+[ -n "$MIRROR" ] && EXTRA="$EXTRA --mirror-port $MIRROR"
+[ "$TONGUE" = "0" ] && EXTRA="$EXTRA --tongue-extras 0"
+
 BIN="$MODDIR/gxr_alvr"
 if [ -f "$MODDIR/dev" ] && [ -x /data/local/tmp/gxr_alvr ]; then
   BIN=/data/local/tmp/gxr_alvr
@@ -17,9 +24,9 @@ fi
 pkill -x gxr_alvr 2>/dev/null
 sleep 1
 if [ -n "$PC" ]; then
-  setsid "$BIN" --pc "$PC" --port "$PORT" </dev/null >>/data/local/tmp/gxr_alvr.log 2>&1 &
+  setsid "$BIN" --pc "$PC" --port "$PORT" $EXTRA </dev/null >>/data/local/tmp/gxr_alvr.log 2>&1 &
 else
-  setsid "$BIN" --port "$PORT" </dev/null >>/data/local/tmp/gxr_alvr.log 2>&1 &
+  setsid "$BIN" --port "$PORT" $EXTRA </dev/null >>/data/local/tmp/gxr_alvr.log 2>&1 &
 fi
 sleep 1
-echo "gxr-alvr: relay=$BIN pid=$(pidof gxr_alvr) -> ${PC:-auto(broadcast)}:$PORT"
+echo "gxr-alvr: relay=$BIN pid=$(pidof gxr_alvr) -> ${PC:-auto(broadcast)}:$PORT mirror=${MIRROR:-none}"

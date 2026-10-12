@@ -36,9 +36,9 @@ Caveats: broadcast reaches every host on the LAN (a second PC running the module
 - **Openness** — `1 - clamp(EyesClosed + EyesClosed*Squint)` per eye.
 - **Pupil** — `2*max(ellipse axes) * PUPIL_MM_SCALE (24)`, with a tracked min/max dilation window (`PUPIL_DILATION_GAIN = 0.75`).
 - **Gaze** — per-eye `yaw = atan2(x,z)`, `pitch = atan2(-yDown,z)` from the host DNN direction (`0x4be378`).
-- **Tongue** — v1 uses the 5 basic DOFs already inside the 68-vector (face indices 63–67). Roll/twist (11→5 MLP) is a follow-up.
+- **Tongue** — the 5 basic DOFs come from the 68-vector (face 63–67). `TongueRoll` is derived from the 11-D `predicted_local_tongue_expression` (uprobe `0x358a34`) via the exact 11→5 mapper plus a DOF-leak-free calibration axis (`--tongue-extras`, default on). Shape (Flat/Squish) and Twist were dropped after live testing — the 11-D model can't separate them reliably.
 
-Offsets (firmware `I610UEU2AZF3`): face `0x3589f8`, jaw `0xf09aa4`, eyedir `0x4be378`, pupil `0x4bef60`.
+Offsets (firmware `I610UEU2AZF3`): face `0x3589f8`, jaw `0xf09aa4`, eyedir `0x4be378`, pupil `0x4bef60`, tongue `0x358a34`.
 
 ## Build / run
 

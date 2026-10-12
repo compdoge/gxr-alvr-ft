@@ -8,17 +8,10 @@ This repo is the **headset side**:
 - `ksu-module/gxr-alvr/`: the **KernelSU module** that starts the sender as
   root at boot, for normal users (no adb at runtime).
 
-The **PC side** is the VRCFaceTracking module [`compdoge/VRCFT-ALVR-UE`](https://github.com/compdoge/VRCFT-ALVR-UE). This is where this sender sends its `UniExpr` wire format.
+The **PC side** is the VRCFaceTracking module [`compdoge/VRCFT-ALVR-UE`](https://github.com/compdoge/VRCFT-ALVR-UE). That is where this sender sends its `UniExpr` wire format.
 
 Requires **root** (KernelSU/DFRoot) on the headset. The sender only *reads*; it never patches or injects into vendor code, and it carries numeric signals only (no camera imagery).
 
-## Install (normal user)
-
-1. Install the **KernelSU module** in the Manager and reboot. Pack `ksu-module/gxr-alvr/` as a zip, or grab a release asset.
-2. Install/enable the **VRCFT-ALVR-UE** module in VRCFaceTracking on the PC.
-3. Done. **No PC IP to type.** With no `pc` file the sender auto-connects by sending each datagram to the **Wi-Fi LAN broadcast address**; the VRCFT-ALVR module binds `0.0.0.0:41463`, so it receives broadcast too.
-
-Requirements: headset and PC on the same LAN; Windows Firewall must allow inbound **UDP 41463** for VRCFaceTracking.
 
 ## Benefits
 
@@ -29,6 +22,16 @@ Using this sender over a generic OpenXR route currently gives you:
 3. Jaw open not being clamped to >0.5 when tongue out
    
 With hopefully more to come!
+
+
+## Install (normal user)
+
+1. Install the **KernelSU module** in the Manager and reboot. Pack `ksu-module/gxr-alvr/` as a zip, or grab a release asset.
+2. Install/enable the **VRCFT-ALVR-UE** module in VRCFaceTracking on the PC.
+3. Done. **No PC IP to type.** With no `pc` file the sender auto-connects by sending each datagram to the **Wi-Fi LAN broadcast address**; the VRCFT-ALVR module binds `0.0.0.0:41463`, so it receives broadcast too.
+
+Requirements: headset and PC on the same LAN; Windows Firewall must allow inbound **UDP 41463** for VRCFaceTracking.
+
 
 ### Pin a specific PC (override)
 

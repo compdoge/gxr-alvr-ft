@@ -12,6 +12,15 @@ PC=$(cat "$MODDIR/pc" 2>/dev/null)
 PORT=$(cat "$MODDIR/port" 2>/dev/null)
 [ -z "$PORT" ] && PORT=41463
 
+# Optional extras (files in the module dir):
+#   mirror = also send a copy to <target>:<this port> (e.g. a monitor tool)
+#   tongue = 0 disables the TongueRoll/Shape/Twist extras (A/B testing)
+MIRROR=$(cat "$MODDIR/mirror" 2>/dev/null)
+TONGUE=$(cat "$MODDIR/tongue" 2>/dev/null)
+EXTRA=""
+[ -n "$MIRROR" ] && EXTRA="$EXTRA --mirror-port $MIRROR"
+[ "$TONGUE" = "0" ] && EXTRA="$EXTRA --tongue-extras 0"
+
 # Shipped binary. Dev opt-in only: create "$MODDIR/dev" to prefer a binary
 # pushed to /data/local/tmp/gxr_alvr. (An unconditional /data/local/tmp
 # override was removed: a stale file there would silently shadow the module
@@ -28,8 +37,8 @@ sleep 8
 pkill -x gxr_alvr 2>/dev/null
 sleep 1
 if [ -n "$PC" ]; then
-  setsid "$BIN" --pc "$PC" --port "$PORT" </dev/null >>/data/local/tmp/gxr_alvr.log 2>&1 &
+  setsid "$BIN" --pc "$PC" --port "$PORT" $EXTRA </dev/null >>/data/local/tmp/gxr_alvr.log 2>&1 &
 else
-  setsid "$BIN" --port "$PORT" </dev/null >>/data/local/tmp/gxr_alvr.log 2>&1 &
+  setsid "$BIN" --port "$PORT" $EXTRA </dev/null >>/data/local/tmp/gxr_alvr.log 2>&1 &
 fi
-echo "gxr-alvr: started relay ($BIN pc=${PC:-auto} port=$PORT pid=$(pidof gxr_alvr))" >>/data/local/tmp/gxr_alvr.log
+echo "gxr-alvr: started relay ($BIN pc=${PC:-auto} port=$PORT mirror=${MIRROR:-none} pid=$(pidof gxr_alvr))" >>/data/local/tmp/gxr_alvr.log

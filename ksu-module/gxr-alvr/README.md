@@ -37,6 +37,18 @@ The Manager **Action** button runs `action.sh`: it stops the current relay and
 starts it again immediately (no reboot). Use it after changing `pc`/`port`, or
 after a dev binary push.
 
+## Monitor / A–B (optional)
+
+To watch the values on the PC while VRCFT keeps 41463, create a `mirror` file
+with the extra port (the relay then sends a copy to `<target>:<port>`):
+
+```sh
+echo 41464 > /data/adb/modules/gxr-alvr/mirror
+```
+
+Set `tongue` to `0` to disable the extra `TongueRoll` parameter (A–B test).
+Both are read at start — tap the **Action** button after changing them.
+
 ## Dev mode (opt-in)
 
 To iterate on the sender without reinstalling the module, create an empty `dev`
@@ -63,7 +75,7 @@ for shipped users.)
 | `uninstall.sh` | stop the relay on uninstall |
 | `sepolicy.rule` | allow the KernelSU root domain to use tracefs (Enforcing) |
 | `module.prop` | module metadata |
-| `pc`, `port`, `dev` | optional overrides (not shipped; create as needed) |
+| `pc`, `port`, `mirror`, `tongue`, `dev` | optional overrides (not shipped; create as needed) |
 
 ## Logs
 

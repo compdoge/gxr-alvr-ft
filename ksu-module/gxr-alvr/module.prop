@@ -1,6 +1,6 @@
 id=gxr-alvr
 name=Galaxy XR ALVR relay
-version=v1.1.0
-versionCode=3
+version=v1.1.2
+versionCode=5
 author=komp
-description=Starts the Galaxy XR perception relay (gxr_alvr) as root at boot (and on late-load). Auto-connects to the PC by broadcasting the full UE parameter set on UDP 41463 (no PC setup needed); pin a PC with the module's pc/port files. Wire format: one ALVR "UniExpr" record.
+description=Starts the Galaxy XR perception relay (gxr_alvr) as root at boot (and on late-load). Auto-connects to the PC by broadcasting the full UE parameter set (incl. TongueRoll) on UDP 41463 (no PC setup needed); pin a PC with the module's pc/port files. Wire format: one ALVR "UniExpr" record.
