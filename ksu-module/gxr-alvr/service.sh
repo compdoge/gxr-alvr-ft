@@ -20,6 +20,7 @@ TONGUE=$(cat "$MODDIR/tongue" 2>/dev/null)
 EXTRA=""
 [ -n "$MIRROR" ] && EXTRA="$EXTRA --mirror-port $MIRROR"
 [ "$TONGUE" = "0" ] && EXTRA="$EXTRA --tongue-extras 0"
+[ -f "$MODDIR/verbose" ] && EXTRA="$EXTRA --verbose"
 
 # Shipped binary. Dev opt-in only: create "$MODDIR/dev" to prefer a binary
 # pushed to /data/local/tmp/gxr_alvr. (An unconditional /data/local/tmp
@@ -33,9 +34,12 @@ fi
 # late_start can be very early; give the system/network a moment.
 sleep 8
 
-# Stop any previous instance, then start fresh.
+# Stop any previous instance (any module version, or a manual dev copy), then
+# start fresh. Hard-kill as a fallback so a wedged/stale peer can't linger and
+# shadow the new binary.
 pkill -x gxr_alvr 2>/dev/null
 sleep 1
+pidof gxr_alvr >/dev/null 2>&1 && { pkill -9 -x gxr_alvr 2>/dev/null; sleep 1; }
 if [ -n "$PC" ]; then
   setsid "$BIN" --pc "$PC" --port "$PORT" $EXTRA </dev/null >>/data/local/tmp/gxr_alvr.log 2>&1 &
 else

@@ -15,6 +15,7 @@ TONGUE=$(cat "$MODDIR/tongue" 2>/dev/null)
 EXTRA=""
 [ -n "$MIRROR" ] && EXTRA="$EXTRA --mirror-port $MIRROR"
 [ "$TONGUE" = "0" ] && EXTRA="$EXTRA --tongue-extras 0"
+[ -f "$MODDIR/verbose" ] && EXTRA="$EXTRA --verbose"
 
 BIN="$MODDIR/gxr_alvr"
 if [ -f "$MODDIR/dev" ] && [ -x /data/local/tmp/gxr_alvr ]; then
@@ -23,6 +24,7 @@ fi
 
 pkill -x gxr_alvr 2>/dev/null
 sleep 1
+pidof gxr_alvr >/dev/null 2>&1 && { pkill -9 -x gxr_alvr 2>/dev/null; sleep 1; }
 if [ -n "$PC" ]; then
   setsid "$BIN" --pc "$PC" --port "$PORT" $EXTRA </dev/null >>/data/local/tmp/gxr_alvr.log 2>&1 &
 else

@@ -33,9 +33,11 @@ Remove `pc` to go back to auto/broadcast. `port` defaults to `41463`.
 
 ## Action button
 
-The Manager **Action** button runs `action.sh`: it stops the current relay and
-starts it again immediately (no reboot). Use it after changing `pc`/`port`, or
-after a dev binary push.
+The Manager **Action** button runs `action.sh`: it stops the current relay
+(incl. any stale copy from an older module version) and starts it again
+immediately (no reboot). Use it after changing `pc`/`port`, or after a dev
+binary push. **A module update does not restart the relay by itself** — tap
+**Action** (or reboot) after installing a new version.
 
 ## Monitor / A–B (optional)
 
@@ -75,7 +77,7 @@ for shipped users.)
 | `uninstall.sh` | stop the relay on uninstall |
 | `sepolicy.rule` | allow the KernelSU root domain to use tracefs (Enforcing) |
 | `module.prop` | module metadata |
-| `pc`, `port`, `mirror`, `tongue`, `dev` | optional overrides (not shipped; create as needed) |
+| `pc`, `port`, `mirror`, `tongue`, `verbose`, `dev` | optional overrides (not shipped; create as needed) |
 
 ## Logs
 

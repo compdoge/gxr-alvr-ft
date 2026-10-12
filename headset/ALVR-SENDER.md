@@ -34,7 +34,7 @@ Caveats: broadcast reaches every host on the LAN (a second PC running the module
 - **68 → UE** (`FACE68_TO_UE`, 66 pairs) — mirrors `RootedLinkFTModule.Face68Map`.
 - **Un-clamped jaw** — `ue[JawOpen]` overridden from the pre-clamp jaw while the vendor tongue-clamp is active (ported from `RootedLinkFTModule.UpdateJaw`).
 - **Openness** — `1 - clamp(EyesClosed + EyesClosed*Squint)` per eye.
-- **Pupil** — `2*max(ellipse axes) * PUPIL_MM_SCALE (24)`, with a tracked min/max dilation window (`PUPIL_DILATION_GAIN = 0.75`).
+- **Pupil** — `2*max(ellipse axes) * PUPIL_MM_SCALE (24)` over fresh, confident detections, with a tracked min/max dilation window (`PUPIL_DILATION_GAIN = 0.75`). The window only moves while both eyes are open, so a wink can't corrupt it.
 - **Gaze** — per-eye `yaw = atan2(x,z)`, `pitch = atan2(-yDown,z)` from the host DNN direction (`0x4be378`).
 - **Tongue** — the 5 basic DOFs come from the 68-vector (face 63–67). `TongueRoll` is derived from the 11-D `predicted_local_tongue_expression` (uprobe `0x358a34`) via the exact 11→5 mapper plus a DOF-leak-free calibration axis (`--tongue-extras`, default on). Shape (Flat/Squish) and Twist were dropped after live testing — the 11-D model can't separate them reliably.
 

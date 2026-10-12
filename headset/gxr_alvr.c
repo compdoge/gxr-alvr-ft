@@ -52,6 +52,10 @@
    tools/gen_tongue_mlp.py from results/tongue-map.json + extra_axes.json). */
 #include "gxr_tongue_mlp.h"
 
+/* Reported in the startup log and by --version, so the running build is always
+   identifiable (avoids "is the new binary actually live?" confusion). */
+#define GXR_VERSION "1.1.7"
+
 #define TRACE "/sys/kernel/tracing"
 #define EYE_PLUGIN "/vendor/lib64/libperception_eye_tracking_host_plugin.so"
 #define FACE_PLUGIN "/vendor/lib64/libperception_face_parameter_tracking_host_plugin.so"
@@ -109,8 +113,14 @@ static const struct { int face; int ue; } FACE68_TO_UE[] = {
 /* --- tuning (match RootedLinkFT defaults; overridable from the CLI) --- */
 static float PUPIL_MM_SCALE = 24.0f;      /* ellipse radius -> mm (module default) */
 static float PUPIL_DILATION_GAIN = 0.75f; /* widens the min/max window by 1/gain */
+static float PUPIL_MIN_CONF = 0.25f;      /* ignore detections below this confidence (v4) */
+static float PUPIL_OPEN_GATE = 0.6f;      /* min/max window moves only while both eyes are this open */
+static float PUPIL_MAX_JUMP = 1.0f;       /* reject a detection this far (mm) from the running value = closed-eye junk */
 #define PUPIL_WINDOW_MIN_MM 0.05f  /* floor for the tracked min/max span */
 #define PUPIL_GAIN_MIN 0.05f       /* floor on the dilation gain divisor */
+#define PUPIL_DET_FRESH_MS 250     /* a detection older than this is stale */
+#define PUPIL_MIN_MM 1.0f          /* plausible pupil-diameter band (reject junk) */
+#define PUPIL_MAX_MM 9.0f
 
 /* A host frame counts as "live" only if it arrived within this window. */
 #define FRESH_MS 500
@@ -491,12 +501,16 @@ static void send_uniexpr(const float *ue, const float *tail) {
 /* ---------------- latest state ---------------- */
 static float g_face[FACE_N]; static long long g_face_ms;
 static int g_eyedir_mask; static float g_Ldir[3], g_Rdir[3]; static long long g_eyedir_ms;
-static float g_det[MAX_DET][6]; static int g_ndet; static long long g_pupil_ms;
+static float g_det[MAX_DET][6]; static float g_det_conf[MAX_DET];
+static long long g_det_ms[MAX_DET]; static int g_det_ok[MAX_DET];
+static long long g_pupil_ms;
 static float g_jaw[4]; static long long g_jaw_ms;
 static float g_tongue[TONGUE_N]; static long long g_tongue_ms;
 
 /* pupil dilation window */
 static float g_minMm = 1e30f, g_maxMm = -1e30f;
+static int g_have_pupil = 0;
+static float g_lastMm = 0.0f, g_lastMin = 0.0f, g_lastMax = 0.0f;
 /* jaw neutral learning (see RootedLinkFTModule.UpdateJaw) */
 static float g_jawHist[JAW_HIST]; static int g_jawN, g_jawIdx; static float g_jawNeutral = 0.2f;
 static long long g_jawNeutralMs;
@@ -586,20 +600,48 @@ static void compute_and_send(void) {
         tail[T_ROpen] = 1.0f - clampf(closedR + closedR * ue[UE_EyeSquintRight], 0.0f, 1.0f);
     }
 
-    int havePupil = (now - g_pupil_ms) <= FRESH_MS && g_ndet > 0;
-    if (havePupil) {
-        float sum = 0.0f;
-        for (int i = 0; i < g_ndet; i++) sum += 2.0f * fmaxf(g_det[i][2], g_det[i][3]);
-        float mm = (sum / (float)g_ndet) * PUPIL_MM_SCALE;
-        tail[T_LPupil] = mm; tail[T_RPupil] = mm;
-        if (mm > 0.0f) {
+    /* 3b) pupil: robust to winks. Only fresh, confident detections count; the
+       tracked min/max window only moves while BOTH eyes are open, so a wink's
+       junk detection can't corrupt it; and the last good reading is held (never
+       zeroed) if a frame has none -- a 0/0 window makes VRCFT's dilation
+       normalize degenerately. */
+    float mm = 0.0f; int nd = 0;
+    for (int i = 0; i < MAX_DET; i++) {
+        if (!g_det_ok[i] || (now - g_det_ms[i]) > PUPIL_DET_FRESH_MS) continue;
+        if (g_det_conf[i] < PUPIL_MIN_CONF) continue;
+        float d = clampf(2.0f * fmaxf(g_det[i][2], g_det[i][3]) * PUPIL_MM_SCALE,
+                         PUPIL_MIN_MM, PUPIL_MAX_MM);
+        /* A closed eye (wink) yields a degenerate ellipse whose diameter is far
+           from the live pupil -- reject it so it can't drag the average (and
+           hence VRCFT's dilation) toward 0. Real dilation changes slowly. */
+        if (g_have_pupil && fabsf(d - g_lastMm) > PUPIL_MAX_JUMP) continue;
+        mm += d; nd++;
+    }
+    if (nd > 0) {
+        mm /= (float)nd;
+        int eyesOpen = !haveFace ||
+            ((tail[T_LOpen] >= PUPIL_OPEN_GATE) && (tail[T_ROpen] >= PUPIL_OPEN_GATE));
+        if (eyesOpen) {
             if (mm < g_minMm) g_minMm = mm;
             if (mm > g_maxMm) g_maxMm = mm;
-            float center = 0.5f * (g_minMm + g_maxMm);
-            float half = 0.5f * fmaxf(g_maxMm - g_minMm, PUPIL_WINDOW_MIN_MM);
-            float wideHalf = half / fmaxf(PUPIL_DILATION_GAIN, PUPIL_GAIN_MIN);
-            tail[T_MinDil] = center - wideHalf;
-            tail[T_MaxDil] = center + wideHalf;
+        }
+        if (g_minMm > g_maxMm) { g_minMm = g_maxMm = mm; }   /* first reading */
+        float center = 0.5f * (g_minMm + g_maxMm);
+        float half = 0.5f * fmaxf(g_maxMm - g_minMm, PUPIL_WINDOW_MIN_MM);
+        float wideHalf = half / fmaxf(PUPIL_DILATION_GAIN, PUPIL_GAIN_MIN);
+        g_lastMm = mm; g_lastMin = center - wideHalf; g_lastMax = center + wideHalf;
+        g_have_pupil = 1;
+    }
+    if (g_have_pupil) {
+        tail[T_LPupil] = g_lastMm; tail[T_RPupil] = g_lastMm;
+        tail[T_MinDil] = g_lastMin; tail[T_MaxDil] = g_lastMax;
+    }
+    if (g_verbose) {
+        static long long lastpup = 0;
+        if (now - lastpup > 1000) {
+            lastpup = now;
+            fprintf(stderr, "gxr_alvr: pupil mm=%.2f nd=%d min=%.2f max=%.2f open=%.2f/%.2f\n",
+                    g_lastMm, nd, g_minMm, g_maxMm, tail[T_LOpen], tail[T_ROpen]);
         }
     }
 
@@ -677,7 +719,12 @@ static void feed_line(const char *line) {
         return;
     }
     if (parse_pten(line, &idx, v) == 0) {
-        if (idx >= 0 && idx < MAX_DET) { memcpy(g_det[idx], v, sizeof(v)); if (idx + 1 > g_ndet) g_ndet = idx + 1; }
+        if (idx >= 0 && idx < MAX_DET) {
+            memcpy(g_det[idx], v, sizeof(v));
+            g_det_conf[idx] = v[4];
+            g_det_ms[idx] = now_ms();
+            g_det_ok[idx] = 1;
+        }
         g_pupil_ms = now_ms();
         return;
     }
@@ -693,11 +740,13 @@ static void usage(FILE *f, const char *argv0) {
         "  --gaze-invert-x 0|1  invert Gaze.x (default 0)\n"
         "  --gaze-invert-y 0|1  invert Gaze.y (default 0)\n"
         "  --selftest           send one synthetic UniExpr and exit (no root)\n"
+        "  --version            print the sender version and exit\n"
         "  --tongue-extras 0|1  emit TongueRoll from the 11-D (default 1)\n"
         "  --tongue-gain-roll <f>  scale the roll readout (default 3.0)\n"
         "  --tongue-gate <f>    zero TongueRoll below this OUT (default 0=off)\n"
         "  --mirror-port <n>    also send a copy to <target>:<n> (for a monitor)\n"
         "  --pupil-mm-scale <f> --pupil-dilation-gain <f>\n"
+        "  --pupil-min-conf <f> --pupil-open-gate <f> --pupil-max-jump <f>\n"
         "  --pupil-offset <hex> --eye-dir-offset <hex>\n"
         "  --face-bs-offset <hex> --jaw-offset <hex> --tongue-offset <hex>\n"
         "  --eye-plugin <path> --face-plugin <path>\n",
@@ -724,6 +773,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--gaze-invert-y") && i + 1 < argc) g_inv_y = atoi(argv[++i]) ? 1 : 0;
         else if (!strcmp(argv[i], "--pupil-mm-scale") && i + 1 < argc) PUPIL_MM_SCALE = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-dilation-gain") && i + 1 < argc) PUPIL_DILATION_GAIN = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--pupil-min-conf") && i + 1 < argc) PUPIL_MIN_CONF = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--pupil-open-gate") && i + 1 < argc) PUPIL_OPEN_GATE = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--pupil-max-jump") && i + 1 < argc) PUPIL_MAX_JUMP = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-offset") && i + 1 < argc) pupil_off = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--eye-dir-offset") && i + 1 < argc) eyedir_off = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--face-bs-offset") && i + 1 < argc) face_off = strtoul(argv[++i], NULL, 0);
@@ -735,6 +787,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--mirror-port") && i + 1 < argc) mirror_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--eye-plugin") && i + 1 < argc) eye_plugin = argv[++i];
         else if (!strcmp(argv[i], "--face-plugin") && i + 1 < argc) face_plugin = argv[++i];
+        else if (!strcmp(argv[i], "--version")) { printf("gxr_alvr %s\n", GXR_VERSION); return 0; }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout, argv[0]); return 0; }
         else { fprintf(stderr, "gxr_alvr: unknown arg: %s\n", argv[i]); usage(stderr, argv[0]); return 2; }
     }
@@ -813,8 +866,8 @@ int main(int argc, char **argv) {
     if (arm_jaw(face_plugin, jaw_off) != 0) fprintf(stderr, "gxr_alvr: jaw probe not armed (continuing)\n");
     if (arm_tongue(face_plugin, tongue_off) != 0) fprintf(stderr, "gxr_alvr: tongue probe not armed (continuing)\n");
     write_file(TRACE "/tracing_on", "1\n");
-    fprintf(stderr, "gxr_alvr: armed pten@0x%lx + eyedir@0x%lx + face68@0x%lx + jaw@0x%lx + tongue@0x%lx -> %s:%d (UniExpr)%s\n",
-            pupil_off, eyedir_off, face_off, jaw_off, tongue_off, target, port,
+    fprintf(stderr, "gxr_alvr: v%s armed pten@0x%lx + eyedir@0x%lx + face68@0x%lx + jaw@0x%lx + tongue@0x%lx -> %s:%d (UniExpr)%s\n",
+            GXR_VERSION, pupil_off, eyedir_off, face_off, jaw_off, tongue_off, target, port,
             g_have_mirror ? " +mirror" : "");
 
     int fd = open(TRACE "/trace_pipe", O_RDONLY);
