@@ -20,6 +20,7 @@ Using this sender over a generic OpenXR route currently gives you:
 1. Eye dilation
 2. Individual eye gaze
 3. Jaw open not being clamped to >0.5 when tongue out
+4. Tongue roll
    
 With hopefully more to come!
 
