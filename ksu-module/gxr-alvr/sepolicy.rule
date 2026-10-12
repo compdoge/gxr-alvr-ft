@@ -1,0 +1,6 @@
+# Allow the KernelSU root domain to arm and read the ftrace uprobes used by
+# gxr_alvr (/sys/kernel/tracing). Needed only if SELinux is Enforcing and the
+# ksu domain is not already permitted. If these types are unknown the rules are
+# ignored (KernelSU logs it) and nothing breaks.
+allow ksu debugfs_tracing_debug:dir { search read open getattr };
+allow ksu debugfs_tracing_debug:file { read write open getattr };

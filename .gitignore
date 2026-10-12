@@ -1,0 +1,20 @@
+# sender build output (rebuild with headset/build_alvr.sh)
+/headset/gxr_alvr
+
+# build/obj dirs
+**/build/
+**/bin/
+**/obj/
+
+# module packages (shipped as GitHub Releases, not in-tree)
+*.zip
+
+# android / signing byproducts
+*.apk
+*.idsig
+android.jar
+*.keystore
+
+# os / editor cruft
+.DS_Store
+Thumbs.db

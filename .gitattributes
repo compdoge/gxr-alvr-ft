@@ -1,0 +1,4 @@
+# Normalize to LF on checkout: the KernelSU module shell scripts run on Android
+# and a CRLF service.sh/action.sh will fail on device.
+* text=auto eol=lf
+ksu-module/gxr-alvr/gxr_alvr -text
