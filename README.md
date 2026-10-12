@@ -29,14 +29,18 @@ With hopefully more to come!
 
 1. Install the **KernelSU module** in the Manager and reboot. Pack `ksu-module/gxr-alvr/` as a zip, or grab a release asset.
 2. Install/enable the **VRCFT-ALVR-UE** module in VRCFaceTracking on the PC.
-3. Done. **No PC IP to type.** With no `pc` file the sender auto-connects by sending each datagram to the **Wi-Fi LAN broadcast address**; the VRCFT-ALVR module binds `0.0.0.0:41463`, so it receives broadcast too.
+3. Done. **No PC IP to type.** With no config the sender broadcasts each datagram to **every interface's LAN broadcast address plus `255.255.255.255`**; the VRCFT-ALVR module binds `0.0.0.0:41463`, so it receives that too.
 
 Requirements: headset and PC on the same LAN; Windows Firewall must allow inbound **UDP 41463** for VRCFaceTracking.
 
 
-### Pin a specific PC (override)
+## Set a custom PC IP
 
-Only needed if the PC is on another subnet, or to avoid broadcasting:
+**Auto-connect is the default** — with no config the sender broadcasts to every interface's LAN broadcast address plus `255.255.255.255`, and the VRCFT-ALVR module (bound `0.0.0.0:41463`) receives that. Set a PC explicitly if it's on another subnet, or if your Wi-Fi access point filters broadcast (a common reason auto-connect "doesn't work").
+
+**Easiest: the module's WebUI.** KernelSU Manager -> **Modules** -> *Galaxy XR ALVR relay* -> tap the **Open** button (or tap the card itself). Enter the PC's IPv4 address and tap **Save & restart relay**. Leave the field empty and Save to go back to auto/broadcast. The page also shows live status (target, pid, headset IP, log tail) and has a **Test** button that pings the PC from the headset, plus **Refresh** to re-read status.
+
+**Or by hand (root):**
 
 ```sh
 echo 192.168.1.50 > /data/adb/modules/gxr-alvr/pc     # as root
@@ -44,7 +48,7 @@ echo 41463        > /data/adb/modules/gxr-alvr/port    # optional
 # then tap the module's Action button in the KernelSU Manager (or reboot)
 ```
 
-Remove `pc` to return to auto/broadcast.
+Delete `pc` to return to auto/broadcast. `port` defaults to `41463`. These option files (`pc`, `port`, `mirror`, `tongue`, `verbose`, `dev`) are **preserved across module updates**.
 
 ## Build the sender
 
@@ -65,12 +69,7 @@ python tools/make_module_zip.py ksu-module/gxr-alvr gxr-alvr.zip   # any OS
 ( cd ksu-module/gxr-alvr && zip -r ../gxr-alvr.zip . )
 ```
 
-**Entry names must use forward slashes.** KernelSU extracts the zip on Linux, so
-a Windows tool that writes `webroot\index.html` (e.g. `ZipFile.CreateFromDirectory`
-or `Compress-Archive`) creates a *literal file with a backslash* at the module
-root instead of a `webroot/` directory — ksud then reports `web=false` and the
-module's WebUI never shows. Use `tools/make_module_zip.py` (writes `/`
-explicitly) or POSIX `zip`.
+**Entry names must use forward slashes.** KernelSU extracts the zip on Linux, so a Windows tool that writes `webroot\index.html` (e.g. `ZipFile.CreateFromDirectory` or `Compress-Archive`) creates a *literal file with a backslash* at the module root instead of a `webroot/` directory — ksud then reports `web=false` and the module's WebUI never shows. Use `tools/make_module_zip.py` (writes `/` explicitly) or POSIX `zip`.
 
 The bundled binary is committed so users can install without a toolchain; if you change `headset/gxr_alvr.c`, rebuild and re-copy it.
 

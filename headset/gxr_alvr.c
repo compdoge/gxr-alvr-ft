@@ -59,7 +59,7 @@
 
 /* Reported in the startup log and by --version, so the running build is always
    identifiable (avoids "is the new binary actually live?" confusion). */
-#define GXR_VERSION "1.2.1"
+#define GXR_VERSION "1.2.2"
 
 #define TRACE "/sys/kernel/tracing"
 #define EYE_PLUGIN "/vendor/lib64/libperception_eye_tracking_host_plugin.so"

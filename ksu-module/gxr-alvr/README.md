@@ -96,7 +96,7 @@ for shipped users.)
 | `uninstall.sh` | stop the relay on uninstall |
 | `sepolicy.rule` | allow the KernelSU root domain to use tracefs (Enforcing) |
 | `module.prop` | module metadata |
-| `pc`, `port`, `mirror`, `tongue`, `verbose`, `dev` | optional overrides (not shipped; create as needed) |
+| `pc`, `port`, `mirror`, `tongue`, `verbose`, `dev` | optional overrides (not shipped; create as needed). **These are preserved across module updates** — the installer copies them into the new version. |
 
 ## Logs
 
