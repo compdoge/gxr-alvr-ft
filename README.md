@@ -4,8 +4,8 @@ Galaxy XR to PC **full face/eye tracking** link. The headset runs a root sender 
 
 This repo is the **headset side**:
 
-- `headset/` — the C sender `gxr_alvr` (+ build script, wire-format doc, tools).
-- `ksu-module/gxr-alvr/` — the **KernelSU module** that starts the sender as
+- `headset/`: the C sender `gxr_alvr` (+ build script, wire-format doc, tools).
+- `ksu-module/gxr-alvr/`: the **KernelSU module** that starts the sender as
   root at boot, for normal users (no adb at runtime).
 
 The **PC side** is the VRCFaceTracking module [`compdoge/VRCFT-ALVR-UE`](https://github.com/compdoge/VRCFT-ALVR-UE). This is where this sender sends its `UniExpr` wire format.
@@ -16,9 +16,19 @@ Requires **root** (KernelSU/DFRoot) on the headset. The sender only *reads*; it 
 
 1. Install the **KernelSU module** in the Manager and reboot. Pack `ksu-module/gxr-alvr/` as a zip, or grab a release asset.
 2. Install/enable the **VRCFT-ALVR-UE** module in VRCFaceTracking on the PC.
-3. Done — **no PC IP to type.** With no `pc` file the sender auto-connects by sending each datagram to the **Wi-Fi LAN broadcast address**; the VRCFT-ALVR module binds `0.0.0.0:41463`, so it receives broadcast too.
+3. Done. **No PC IP to type.** With no `pc` file the sender auto-connects by sending each datagram to the **Wi-Fi LAN broadcast address**; the VRCFT-ALVR module binds `0.0.0.0:41463`, so it receives broadcast too.
 
 Requirements: headset and PC on the same LAN; Windows Firewall must allow inbound **UDP 41463** for VRCFaceTracking.
+
+## Benefits
+
+Using this sender over a generic OpenXR route currently gives you:
+
+1. Eye dilation
+2. Individual eye gaze
+3. Jaw open not being clamped to >0.5 when tongue out
+   
+With hopefully more to come!
 
 ### Pin a specific PC (override)
 
@@ -51,10 +61,6 @@ cp headset/gxr_alvr ksu-module/gxr-alvr/gxr_alvr
 
 The bundled binary is committed so users can install without a toolchain; if you change `headset/gxr_alvr.c`, rebuild and re-copy it.
 
-## Test in VRChat
-
-Put the headset on and look at your avatar — the face and eyes should follow yours.
-
 ## Wire format
 
 One UDP datagram to port **41463** (`0xA1F7`) = `"UniExpr\0"` + 88 `float32` Unified-Expression weights + an 11-float eye tail (openness, pupil, per-eye pitch/yaw) → **404 bytes**. Read `headset/ALVR-SENDER.md` and the VRCFT-ALVR-UE module for details.
@@ -69,4 +75,4 @@ The 88 weights are indexed by VRCFaceTracking's `UnifiedExpressions` (`Max = 88`
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT: see [`LICENSE`](LICENSE).
