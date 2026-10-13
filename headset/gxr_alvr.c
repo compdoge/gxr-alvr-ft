@@ -59,7 +59,7 @@
 
 /* Reported in the startup log and by --version, so the running build is always
    identifiable (avoids "is the new binary actually live?" confusion). */
-#define GXR_VERSION "1.2.4"
+#define GXR_VERSION "1.2.9"
 
 #define TRACE "/sys/kernel/tracing"
 #define EYE_PLUGIN "/vendor/lib64/libperception_eye_tracking_host_plugin.so"
@@ -116,18 +116,25 @@ static const struct { int face; int ue; } FACE68_TO_UE[] = {
 #define NTAB ((int)(sizeof(FACE68_TO_UE)/sizeof(FACE68_TO_UE[0])))
 
 /* --- tuning (match RootedLinkFT defaults; overridable from the CLI) --- */
-static float PUPIL_MM_SCALE = 24.0f;      /* ellipse radius -> mm (module default) */
 static float PUPIL_DILATION_GAIN = 0.75f; /* widens the min/max window by 1/gain */
 static float PUPIL_MIN_CONF = 0.25f;      /* ignore detections below this confidence (v4) */
-static float PUPIL_OPEN_GATE = 0.6f;      /* min/max window moves only while both eyes are this open */
-static float PUPIL_MAX_JUMP = 1.0f;       /* reject a detection this far (mm) from the running value = closed-eye junk */
-static float PUPIL_RELOCK_MS = 1500.0f;   /* if nothing has been accepted for this long, accept the fresh reading (never lock out) */
+static float PUPIL_OPEN_GATE = 0.6f;      /* per-eye openness below this counts as the lid being shut */
+static float PUPIL_MAX_JUMP = 1.0f;       /* a per-eye jump this big (mm) is occlusion, not pupil */
+static float PUPIL_RELOCK_MS = 1500.0f;   /* forget an eye that has given nothing for this long (never lock out) */
+static float PUPIL_SMOOTH_MS = 350.0f;    /* per-eye low-pass time constant (ms); a single eye is noisier than the pair */
+#define PUPIL_MM_SCALE 24.0f       /* detection ellipse radius -> mm. Fixed, not a setting:
+                                      VRCFT normalizes the sent diameter against the window
+                                      we also send, so this scale cancels out. */
 #define PUPIL_WINDOW_MIN_MM 0.05f  /* floor for the tracked min/max span */
 #define PUPIL_WINDOW_MARGIN 0.01f  /* emitted window is forced to contain the pupil by >= this (mm) */
+#define PUPIL_WINDOW_OPEN 0.8f     /* dilation envelope only grows while both lids are >= this open */
+#define PUPIL_WINDOW_DWELL_MS 300  /* ...and a new extreme must persist this long to be committed */
+#define PUPIL_WINDOW_CONFIRM 0.15f /* ...staying within this (mm) of the candidate extreme */
 #define PUPIL_GAIN_MIN 0.05f       /* floor on the dilation gain divisor */
 #define PUPIL_DET_FRESH_MS 250     /* a detection older than this is stale */
 #define PUPIL_LOG_MS 250           /* --verbose pupil line cadence (fast, to catch a wink) */
-#define PUPIL_EYE_GAP 1.5f         /* the two eyes' pupils should be within this (mm); more = a lid occludes one */
+#define PUPIL_EYE_GAP 1.5f         /* one eye this far (mm) below the other = a lid is occluding it */
+#define PUPIL_EYE_CLEAR 0.6f       /* ...and occlusion clears once they are this close again (hysteresis) */
 #define PUPIL_MIN_MM 1.0f          /* plausible pupil-diameter band (reject junk) */
 #define PUPIL_MAX_MM 9.0f
 
@@ -553,14 +560,21 @@ static float g_jaw[4]; static long long g_jaw_ms;
 static float g_tongue[TONGUE_N]; static long long g_tongue_ms;
 
 /* pupil dilation window */
-static float g_minMm = 1e30f, g_maxMm = -1e30f;
+static float g_minMm = 0.0f, g_maxMm = 0.0f;
 static int g_have_pupil = 0;
 static float g_lastMm = 0.0f, g_lastMin = 0.0f, g_lastMax = 0.0f;
 static long long g_pupilAcceptMs;   /* last frame a pupil reading was accepted */
-/* per-eye pupil (0 = left: detections 0/1, 1 = right: detections 2/3) */
-static float g_eyeMm[2];
-static long long g_eyeAcceptMs[2];
+/* per-eye pupil tracking (0 = left: detections 0/1, 1 = right: detections 2/3) */
+static float g_eyeS[2];         /* smoothed per-eye pupil diameter (mm) */
+static long long g_eyeMs[2];    /* last time this eye produced a usable reading */
 static int g_eyeHave[2];
+static int g_eyeOccl[2];        /* hysteresis: this eye's lid is occluding it */
+static float g_pairMm;          /* baseline: last both-eyes-open pair average */
+static float g_pairEye[2];      /* the two eyes' smoothed values at that frame */
+static int g_pairHave;
+static long long g_emaMs;       /* last pupil smoothing step (EMA dt) */
+static float g_winMinCand, g_winMaxCand;   /* dwell-confirmed extremes for the dilation envelope */
+static long long g_winMinMs, g_winMaxMs;
 /* jaw neutral learning (see RootedLinkFTModule.UpdateJaw) */
 static float g_jawHist[JAW_HIST]; static int g_jawN, g_jawIdx; static float g_jawNeutral = 0.2f;
 static long long g_jawNeutralMs;
@@ -650,73 +664,102 @@ static void compute_and_send(void) {
         tail[T_ROpen] = 1.0f - clampf(closedR + closedR * ue[UE_EyeSquintRight], 0.0f, 1.0f);
     }
 
-    /* 3b) pupil: per eye. The probe returns two candidate detections per eye --
-       idx 0/1 = LEFT, 2/3 = RIGHT. Confirmed on-device by winking each eye: the
-       closed lid collapses that eye's detections to ~1 mm while the other eye
-       stays ~4 mm, and the closed eye's detections KEEP ARRIVING, so freshness
-       alone can't tell them apart. So each eye's largest candidate is taken (a
-       lid occludes -> a smaller fit) and the eyes are combined:
-         - both present and within PUPIL_EYE_GAP  -> average them;
-         - present but disagreeing                -> a wink: keep the eye that
-           did NOT jump away from its own recent value (the open one);
-         - only one eye present                   -> keep it if steady, else
-           relock after a while (never lock out).
-       A wink therefore keeps the value live from the open eye instead of
-       freezing; only a full blink with no usable eye holds. The min/max envelope
-       moves only when BOTH eyes agree (the stuck-at-0 protection), and the
-       emitted window is still forced to contain the emitted pupil. */
-    int eyeOpen[2];
-    eyeOpen[0] = !haveFace || (tail[T_LOpen] >= PUPIL_OPEN_GATE);
-    eyeOpen[1] = !haveFace || (tail[T_ROpen] >= PUPIL_OPEN_GATE);
-    float dmax[2] = { 0.0f, 0.0f };
+    /* 3b) pupil: per eye, smoothed, with a drift-based fallback so a wink no
+       longer steps or jitters the dilation. The probe returns two candidate
+       detections per eye -- idx 0/1 = LEFT, 2/3 = RIGHT (confirmed on-device:
+       the closed lid collapses that eye's detections to ~1 mm while the other
+       eye stays ~4 mm, and the closed eye's detections KEEP ARRIVING, so
+       freshness alone can't tell them apart). Each eye's largest candidate is
+       taken (a lid occludes -> a smaller fit) and low-pass filtered, because a
+       single eye is noisier than the two-eye average. A wink is detected by the
+       eyes disagreeing (with hysteresis, and confirmed by a shut lid); the
+       still-open eye then drives the value as its DRIFT from the last
+       both-eyes-open pair average -- so dropping one lid neither steps the
+       emitted dilation nor injects that eye's noise. Only a full blink with no
+       usable eye holds (last good value, never 0). Because the emitted value is
+       drift-calibrated and continuous, the min/max envelope can follow it even
+       through a wink, and the emitted window is still forced to contain the
+       emitted pupil (VRCFT pins dilation to 0 when pupil <= min). */
+    float raw[2] = { 0.0f, 0.0f };
     for (int i = 0; i < 4; i++) {                       /* 0/1 = left, 2/3 = right */
         int e = i >> 1;
         if (!g_det_ok[i] || (now - g_det_ms[i]) > PUPIL_DET_FRESH_MS) continue;
         if (g_det_conf[i] < PUPIL_MIN_CONF) continue;
-        float d = clampf(2.0f * fmaxf(g_det[i][2], g_det[i][3]) * PUPIL_MM_SCALE,
-                         PUPIL_MIN_MM, PUPIL_MAX_MM);
-        if (d > dmax[e]) dmax[e] = d;
+        float ax = fmaxf(g_det[i][2], g_det[i][3]);
+        if (ax <= 0.0f) continue;   /* no ellipse at all: junk, don't clamp it into the band */
+        float d = clampf(2.0f * ax * PUPIL_MM_SCALE, PUPIL_MIN_MM, PUPIL_MAX_MM);
+        if (d > raw[e]) raw[e] = d;
     }
-    int haveL = dmax[0] > 0.0f, haveR = dmax[1] > 0.0f;
-    float mm = 0.0f; int nd = 0; int moveWindow = 0;
-    if (haveL && haveR) {
-        if (fabsf(dmax[0] - dmax[1]) <= PUPIL_EYE_GAP) {
-            mm = 0.5f * (dmax[0] + dmax[1]); nd = 2; moveWindow = 1;
-        } else {
-            /* One eye disagreed: it is the occluded (winking) one. Keep the eye
-               that did not jump away from its own recent value. */
-            float chL = g_eyeHave[0] ? fabsf(dmax[0] - g_eyeMm[0]) : 1e9f;
-            float chR = g_eyeHave[1] ? fabsf(dmax[1] - g_eyeMm[1]) : 1e9f;
-            int keep = (chL == chR) ? (dmax[0] >= dmax[1] ? 0 : 1) : (chL < chR ? 0 : 1);
-            mm = dmax[keep]; nd = 1;
-            g_eyeMm[keep] = dmax[keep]; g_eyeAcceptMs[keep] = now; g_eyeHave[keep] = 1;
-        }
-    } else if (haveL || haveR) {
-        int e = haveL ? 0 : 1;
-        float d = dmax[e];
-        int steady = g_eyeHave[e] && fabsf(d - g_eyeMm[e]) <= PUPIL_MAX_JUMP;
-        int adopt = !g_eyeHave[e] ||
-                    (eyeOpen[e] && (float)(now - g_eyeAcceptMs[e]) >= PUPIL_RELOCK_MS);
-        if (steady || adopt) {
-            mm = d; nd = 1;
-            g_eyeMm[e] = d; g_eyeAcceptMs[e] = now; g_eyeHave[e] = 1;
-        }
+    int eyeOpen[2];
+    eyeOpen[0] = !haveFace || (tail[T_LOpen] >= PUPIL_OPEN_GATE);
+    eyeOpen[1] = !haveFace || (tail[T_ROpen] >= PUPIL_OPEN_GATE);
+    float dt = (float)(now - g_emaMs); g_emaMs = now;
+    float alpha = (dt > 0.0f) ? (1.0f - expf(-dt / fmaxf(PUPIL_SMOOTH_MS, 1.0f))) : 0.0f;
+    for (int e = 0; e < 2; e++) {
+        if (now - g_eyeMs[e] > (long long)PUPIL_RELOCK_MS) { g_eyeHave[e] = 0; g_eyeOccl[e] = 0; }
+        if (raw[e] <= 0.0f) continue;
+        /* A shut lid over a collapsed eye, or an eye sitting well below the other,
+           means it is occluded (a wink, or a full blink). */
+        int lidCollapse = !eyeOpen[e] && g_eyeHave[e] && raw[e] < g_eyeS[e] - PUPIL_MAX_JUMP;
+        if (!g_eyeHave[e]) { g_eyeS[e] = raw[e]; g_eyeHave[e] = 1; }
+        else if (!g_eyeOccl[e])                         /* never fold occluded junk in */
+            g_eyeS[e] += alpha * (raw[e] - g_eyeS[e]);
+        g_eyeMs[e] = now;
+        float ev = (raw[0] > 0.0f && raw[1] > 0.0f) ? (raw[1 - e] - raw[e]) : -1e9f;
+        int wasOccl = g_eyeOccl[e];
+        if (g_eyeOccl[e]) { if (ev < PUPIL_EYE_CLEAR && !lidCollapse) g_eyeOccl[e] = 0; }
+        else if (ev > PUPIL_EYE_GAP || lidCollapse) g_eyeOccl[e] = 1;
+        /* An eye that just reopened still holds its stale frozen value; re-seed it
+           so the both-eyes average is continuous across the reopen (no dip/step). */
+        if (wasOccl && !g_eyeOccl[e])
+            g_eyeS[e] = g_have_pupil ? (2.0f * g_lastMm - g_eyeS[1 - e]) : raw[e];
+    }
+    int valid[2];
+    for (int e = 0; e < 2; e++)
+        valid[e] = g_eyeHave[e] && !g_eyeOccl[e] && (now - g_eyeMs[e]) <= PUPIL_DET_FRESH_MS;
+    float mm = 0.0f; int nd = 0;
+    if (valid[0] && valid[1]) {
+        mm = 0.5f * (g_eyeS[0] + g_eyeS[1]); nd = 2;
+        g_pairMm = mm; g_pairEye[0] = g_eyeS[0]; g_pairEye[1] = g_eyeS[1]; g_pairHave = 1;
+    } else if (valid[0] || valid[1]) {
+        int e = valid[0] ? 0 : 1;
+        /* Continue from the last both-eyes baseline and apply only the open eye's
+           drift: no step when the other lid drops. */
+        mm = g_pairHave ? g_pairMm + (g_eyeS[e] - g_pairEye[e]) : g_eyeS[e];
+        nd = 1;
     }
     if (nd > 0) {
-        if (nd == 2) {                                  /* both eyes agree: track both */
-            g_eyeMm[0] = dmax[0]; g_eyeMm[1] = dmax[1];
-            g_eyeAcceptMs[0] = g_eyeAcceptMs[1] = now;
-            g_eyeHave[0] = g_eyeHave[1] = 1;
+        /* The dilation envelope (min/max pupil) is what VRCFT normalizes against
+           -- the module feeds it our window every frame -- so it must reflect the
+           user's real range and nothing else. It therefore grows only from frames
+           that are fully trustworthy: both eyes reading cleanly (never occluded)
+           with both lids clearly open, and a new extreme has to persist for
+           PUPIL_WINDOW_DWELL_MS before it is committed. A squint, a blink, or bad
+           data (e.g. the headset briefly off) can no longer widen the window and
+           flatten the whole dilation range. */
+        int winClean = haveFace && valid[0] && valid[1] &&
+                       (tail[T_LOpen] >= PUPIL_WINDOW_OPEN) &&
+                       (tail[T_ROpen] >= PUPIL_WINDOW_OPEN);
+        if (!g_have_pupil) {                            /* first reading seeds the envelope */
+            g_minMm = g_maxMm = mm;
+            g_winMinCand = g_winMaxCand = mm;
+            g_winMinMs = g_winMaxMs = now;
+        } else if (winClean) {
+            if (mm < g_minMm) {
+                if (mm < g_winMinCand - PUPIL_WINDOW_CONFIRM) { g_winMinCand = mm; g_winMinMs = now; }
+                else if (mm < g_winMinCand) g_winMinCand = mm;
+                if ((float)(now - g_winMinMs) >= PUPIL_WINDOW_DWELL_MS) g_minMm = g_winMinCand;
+            } else { g_winMinCand = mm; g_winMinMs = now; }
+            if (mm > g_maxMm) {
+                if (mm > g_winMaxCand + PUPIL_WINDOW_CONFIRM) { g_winMaxCand = mm; g_winMaxMs = now; }
+                else if (mm > g_winMaxCand) g_winMaxCand = mm;
+                if ((float)(now - g_winMaxMs) >= PUPIL_WINDOW_DWELL_MS) g_maxMm = g_winMaxCand;
+            } else { g_winMaxCand = mm; g_winMaxMs = now; }
         }
         g_lastMm = mm;
         g_pupilAcceptMs = now;
         g_have_pupil = 1;
-        if (moveWindow) {                               /* both eyes open -> envelope may move */
-            if (mm < g_minMm) g_minMm = mm;
-            if (mm > g_maxMm) g_maxMm = mm;
-        }
     }
-    if (g_minMm > g_maxMm) { g_minMm = g_maxMm = g_lastMm; }   /* first reading */
     if (g_have_pupil) {
         float center = 0.5f * (g_minMm + g_maxMm);
         float half = 0.5f * fmaxf(g_maxMm - g_minMm, PUPIL_WINDOW_MIN_MM);
@@ -737,9 +780,10 @@ static void compute_and_send(void) {
             lastpup = now;
             /* Per-detection dump: idx:d<mm>/c<conf>/x<centre-x>/a<age-ms>. The
                diameter here is UNCLAMPED so junk is visible. */
-            fprintf(stderr, "gxr_alvr: pupil mm=%.2f nd=%d min=%.2f max=%.2f open=%.2f/%.2f gate=%d/%d closed=%.2f/%.2f det=",
+            fprintf(stderr, "gxr_alvr: pupil mm=%.2f nd=%d min=%.2f max=%.2f open=%.2f/%.2f eye=%d%d oc=%d%d raw=%.2f/%.2f s=%.2f/%.2f closed=%.2f/%.2f det=",
                     g_lastMm, nd, g_minMm, g_maxMm, tail[T_LOpen], tail[T_ROpen],
-                    eyeOpen[0], eyeOpen[1],
+                    eyeOpen[0], eyeOpen[1], g_eyeOccl[0], g_eyeOccl[1],
+                    raw[0], raw[1], g_eyeS[0], g_eyeS[1],
                     haveFace ? g_face[F_EYES_CLOSED_L] : -1.0f,
                     haveFace ? g_face[F_EYES_CLOSED_R] : -1.0f);
             for (int i = 0; i < MAX_DET; i++) {
@@ -852,9 +896,10 @@ static void usage(FILE *f, const char *argv0) {
         "  --tongue-gain-roll <f>  scale the roll readout (default 3.0)\n"
         "  --tongue-gate <f>    zero TongueRoll below this OUT (default 0=off)\n"
         "  --mirror-port <n>    also send a copy to <target>:<n> (for a monitor)\n"
-        "  --pupil-mm-scale <f> --pupil-dilation-gain <f>\n"
+        "  --pupil-dilation-gain <f>\n"
         "  --pupil-min-conf <f> --pupil-open-gate <f> --pupil-max-jump <f>\n"
-        "  --pupil-relock-ms <f>  accept a fresh reading after this long with none (default 1500)\n"
+        "  --pupil-relock-ms <f>  forget an eye after this long with no reading (default 1500)\n"
+        "  --pupil-smooth-ms <f>  per-eye low-pass time constant (default 350)\n"
         "  --pupil-offset <hex> --eye-dir-offset <hex>\n"
         "  --face-bs-offset <hex> --jaw-offset <hex> --tongue-offset <hex>\n"
         "  --eye-plugin <path> --face-plugin <path>\n",
@@ -879,12 +924,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--gaze-swap") && i + 1 < argc) g_swap = atoi(argv[++i]) ? 1 : 0;
         else if (!strcmp(argv[i], "--gaze-invert-x") && i + 1 < argc) g_inv_x = atoi(argv[++i]) ? 1 : 0;
         else if (!strcmp(argv[i], "--gaze-invert-y") && i + 1 < argc) g_inv_y = atoi(argv[++i]) ? 1 : 0;
-        else if (!strcmp(argv[i], "--pupil-mm-scale") && i + 1 < argc) PUPIL_MM_SCALE = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-dilation-gain") && i + 1 < argc) PUPIL_DILATION_GAIN = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-min-conf") && i + 1 < argc) PUPIL_MIN_CONF = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-open-gate") && i + 1 < argc) PUPIL_OPEN_GATE = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-max-jump") && i + 1 < argc) PUPIL_MAX_JUMP = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-relock-ms") && i + 1 < argc) PUPIL_RELOCK_MS = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--pupil-smooth-ms") && i + 1 < argc) PUPIL_SMOOTH_MS = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-offset") && i + 1 < argc) pupil_off = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--eye-dir-offset") && i + 1 < argc) eyedir_off = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--face-bs-offset") && i + 1 < argc) face_off = strtoul(argv[++i], NULL, 0);

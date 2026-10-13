@@ -13,14 +13,24 @@ PORT=$(cat "$MODDIR/port" 2>/dev/null)
 [ -z "$PORT" ] && PORT=41463
 
 # Optional extras (files in the module dir):
-#   mirror = also send a copy to <target>:<this port> (e.g. a monitor tool)
-#   tongue = 0 disables the TongueRoll/Shape/Twist extras (A/B testing)
+#   mirror  = also send a copy to <target>:<this port> (e.g. a monitor tool)
+#   tongue  = 0 disables the TongueRoll/Shape/Twist extras (A/B testing)
+#   verbose = present enables the 1 Hz trace
+#   devopts = extra sender flags from the WebUI "Developer options", one
+#             "--flag value" per line. Data-only: reject shell metacharacters.
 MIRROR=$(cat "$MODDIR/mirror" 2>/dev/null)
 TONGUE=$(cat "$MODDIR/tongue" 2>/dev/null)
 EXTRA=""
 [ -n "$MIRROR" ] && EXTRA="$EXTRA --mirror-port $MIRROR"
 [ "$TONGUE" = "0" ] && EXTRA="$EXTRA --tongue-extras 0"
 [ -f "$MODDIR/verbose" ] && EXTRA="$EXTRA --verbose"
+if [ -f "$MODDIR/devopts" ]; then
+  if grep -qvE '^(--[a-z0-9-]+( [A-Za-z0-9._,:/+-]+)?)?$' "$MODDIR/devopts"; then
+    echo "gxr-alvr: ignoring devopts (unexpected content)" >>/data/local/tmp/gxr_alvr.log
+  else
+    EXTRA="$EXTRA $(tr '\n' ' ' < "$MODDIR/devopts")"
+  fi
+fi
 
 # Shipped binary. Dev opt-in only: create "$MODDIR/dev" to prefer a binary
 # pushed to /data/local/tmp/gxr_alvr. (An unconditional /data/local/tmp

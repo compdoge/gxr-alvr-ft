@@ -16,6 +16,9 @@ case "$1" in
     echo "mirror=$(readval mirror)"
     echo "tongue=$(readval tongue)"
     echo "verbose=$([ -f "$MODDIR/verbose" ] && echo 1 || echo 0)"
+    dv=""
+    if [ -f "$MODDIR/devopts" ]; then dv=$(sed 's/ /=/' "$MODDIR/devopts" | tr '\n' ';'); dv=${dv%;}; fi
+    echo "devopts=$dv"
     echo "pid=$(pidof gxr_alvr 2>/dev/null)"
     echo "ip=$(ip -4 addr show 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{print $2}' | tr '\n' ',')"
     echo "armed=$(grep -a 'gxr_alvr: v' "$LOG" 2>/dev/null | tail -n1)"
@@ -42,6 +45,24 @@ case "$1" in
     echo "ok=1"
     echo "pid=$(pidof gxr_alvr 2>/dev/null)"
     ;;
+  setdev)
+    # setdev <--flag=value;--flag=value | ->  -> write devopts (validated) + restart
+    SPEC="$2"
+    if [ -z "$SPEC" ] || [ "$SPEC" = "-" ]; then
+      rm -f "$MODDIR/devopts" 2>/dev/null
+    else
+      if ! printf '%s' "$SPEC" | grep -qE '^[A-Za-z0-9._,:/+;=-]+$'; then
+        echo "error=invalid characters in dev options"; exit 2
+      fi
+      BAD=$(printf '%s' "$SPEC" | tr ';' '\n' | grep -vE '^--[a-z0-9-]+=[A-Za-z0-9._,:/+-]+$')
+      if [ -n "$BAD" ]; then echo "error=bad dev option: $BAD"; exit 2; fi
+      printf '%s\n' "$SPEC" | tr ';' '\n' | sed 's/=/ /' > "$MODDIR/devopts"
+    fi
+    sh "$MODDIR/action.sh" >/dev/null 2>&1
+    sleep 1
+    echo "ok=1"
+    echo "pid=$(pidof gxr_alvr 2>/dev/null)"
+    ;;
   test)
     # test <ip>  -> best-effort reachability check from the headset
     IP="$2"
@@ -53,7 +74,7 @@ case "$1" in
     fi
     ;;
   *)
-    echo "error=usage: status | set <pc|-|auto> <port> <tongue> <verbose> | test <ip>"
+    echo "error=usage: status | set <pc|-|auto> <port> <tongue> <verbose> | setdev <spec|-> | test <ip>"
     exit 2
     ;;
 esac

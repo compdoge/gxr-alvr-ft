@@ -41,6 +41,25 @@
   .ok { color:var(--ok); } .warn { color:var(--warn); } .err { color:var(--err); }
   .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px;
           background:#262626; color:var(--dim); margin-left:6px; }
+  details.card > summary { cursor:pointer; list-style:none; }
+  details.card > summary::-webkit-details-marker { display:none; }
+  details.card > summary h2 { display:inline; margin:0; }
+  details.card > summary::after { content:" \25BE"; color:var(--dim); }
+  details.card[open] > summary::after { content:" \25B4"; }
+  .devnote { color:var(--dim); font-size:12px; margin:10px 0 0; }
+  .opt { margin:14px 0 0; }
+  .opt .head { display:flex; gap:10px; align-items:center; }
+  .opt .flag { flex:1; min-width:0; word-break:break-all; font-size:12px; color:var(--accent);
+               font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .opt input, .opt select { width:132px; flex:0 0 132px; padding:8px 10px; border-radius:8px;
+               border:1px solid var(--line); background:#0e0e0e; color:var(--fg); font-size:14px; }
+  .opt .hint { margin-top:3px; }
+  #dev-adv { margin:16px 0 0; border-top:1px solid var(--line); padding-top:12px; }
+  #dev-adv > summary { cursor:pointer; list-style:none; font-size:12px; color:var(--dim); }
+  #dev-adv > summary::-webkit-details-marker { display:none; }
+  #dev-adv > summary::after { content:" \25BE"; }
+  #dev-adv[open] > summary::after { content:" \25B4"; }
+  #dev-adv .opt { margin-top:12px; }
 </style>
 </head>
 <body>
@@ -81,6 +100,26 @@
     </div>
     <div id="save-result" class="hint"></div>
   </div>
+
+  <details class="card" id="dev-card">
+    <summary><h2>Developer options</h2></summary>
+    <p class="devnote">Optional sender tuning. Values are passed straight to
+      <span class="mono">gxr_alvr</span>; a field left at its default is omitted.
+      PC&nbsp;IP, port, TongueRoll and Verbose live in <b>Connection</b>.</p>
+    <div id="dev-list"></div>
+    <details id="dev-adv">
+      <summary>Advanced &mdash; firmware probes (change only if your firmware differs)</summary>
+      <p class="devnote">Memory offsets and plugin paths for this firmware
+        (<span class="mono">I610UEU2AZF3</span>). A wrong value here stops face/eye
+        tracking entirely.</p>
+      <div id="dev-adv-list"></div>
+    </details>
+    <div class="btns">
+      <button class="primary" id="btn-dev-save">Save &amp; restart relay</button>
+      <button id="btn-dev-reset">Reset to defaults</button>
+    </div>
+    <div id="dev-result" class="hint"></div>
+  </details>
 
   <div class="card">
     <h2>Log tail</h2>
@@ -135,7 +174,7 @@ function parseKV(out) {
 
 function setBusy(b) {
   BUSY = b;
-  ["btn-save", "btn-refresh", "btn-test"].forEach(function (id) { $(id).disabled = b; });
+  ["btn-save", "btn-refresh", "btn-test", "btn-dev-save", "btn-dev-reset"].forEach(function (id) { $(id).disabled = b; });
 }
 
 function refresh() {
@@ -155,6 +194,7 @@ function refresh() {
     if (document.activeElement !== $("port")) $("port").value = s.port || "41463";
     $("tongue").checked = (s.tongue !== "0");           /* file absent == on */
     $("verbose").checked = (s.verbose === "1");
+    loadDev(s.devopts);
     $("s-armed").textContent = s.armed || "(no startup line yet)";
     $("s-pid").textContent = s.pid || "(not running)";
     $("s-pid").className = s.pid ? "mono ok" : "mono err";
@@ -228,10 +268,141 @@ function test() {
   });
 }
 
+/* ---- Developer options. `d` is the sender's built-in default, so a field equal
+   to it is not written to the devopts file. */
+var DEVOPTS = [
+  { f:"--mirror-port", d:"0", k:"num", t:"Also send a copy of every packet to the target on this UDP port (0 = off; for a monitor tool)." },
+  { f:"--tongue-gain-roll", d:"3", k:"num", t:"TongueRoll scale factor." },
+  { f:"--pupil-dilation-gain", d:"0.75", k:"num", t:"Widens the dilation window by 1/gain. Raise toward 1.0 for a wider, more sensitive dilation range." },
+  { f:"--pupil-smooth-ms", d:"350", k:"num", t:"Per-eye low-pass time constant. Higher = steadier but slower to follow." },
+  { f:"--pupil-min-conf", d:"0.25", k:"num", t:"Ignore pupil detections whose confidence is below this." }
+];
+
+/* Firmware-specific probes, kept so the module can follow a firmware change
+   without a rebuild -- but a wrong value here stops face/eye tracking entirely. */
+var DEVOPTS_ADV = [
+  { f:"--pupil-offset", d:"0x4bef60", k:"text", t:"Memory offset of the pupil probe." },
+  { f:"--eye-dir-offset", d:"0x4be378", k:"text", t:"Memory offset of the eye-direction probe." },
+  { f:"--face-bs-offset", d:"0x3589f8", k:"text", t:"Memory offset of the face-blendshape probe." },
+  { f:"--jaw-offset", d:"0xf09aa4", k:"text", t:"Memory offset of the jaw probe." },
+  { f:"--tongue-offset", d:"0x358a34", k:"text", t:"Memory offset of the tongue probe." },
+  { f:"--eye-plugin", d:"/vendor/lib64/libperception_eye_tracking_host_plugin.so", k:"text", t:"Eye-tracking host plugin path." },
+  { f:"--face-plugin", d:"/vendor/lib64/libperception_face_parameter_tracking_host_plugin.so", k:"text", t:"Face-tracking host plugin path." }
+];
+var ALL_DEV = DEVOPTS.concat(DEVOPTS_ADV);
+
+function devEl(flag) {
+  return $("dev-card").querySelector('[data-flag="' + flag + '"]');
+}
+
+function makeDevInput(o) {
+  var el;
+  if (o.k === "bool") {
+    el = document.createElement("select");
+    [["0", "Off"], ["1", "On"]].forEach(function (p) {
+      var op = document.createElement("option");
+      op.value = p[0]; op.textContent = p[1]; el.appendChild(op);
+    });
+  } else {
+    el = document.createElement("input");
+    el.type = (o.k === "num") ? "number" : "text";
+    el.step = "any"; el.spellcheck = false; el.autocomplete = "off";
+  }
+  el.setAttribute("data-flag", o.f);
+  return el;
+}
+
+function fillDev(hostId, list) {
+  var host = $(hostId);
+  host.innerHTML = "";
+  list.forEach(function (o) {
+    var wrap = document.createElement("div"); wrap.className = "opt";
+    var head = document.createElement("div"); head.className = "head";
+    var lab = document.createElement("span"); lab.className = "flag"; lab.textContent = o.f;
+    head.appendChild(lab); head.appendChild(makeDevInput(o));
+    var hint = document.createElement("div"); hint.className = "hint"; hint.textContent = o.t;
+    wrap.appendChild(head); wrap.appendChild(hint);
+    host.appendChild(wrap);
+  });
+}
+
+function renderDev() {
+  fillDev("dev-list", DEVOPTS);
+  fillDev("dev-adv-list", DEVOPTS_ADV);
+}
+
+function loadDev(spec) {
+  var map = {};
+  (spec || "").split(";").forEach(function (kv) {
+    var i = kv.indexOf("=");
+    if (i > 0) map[kv.slice(0, i)] = kv.slice(i + 1);
+  });
+  ALL_DEV.forEach(function (o) {
+    var el = devEl(o.f);
+    if (!el) return;
+    var v = (o.f in map) ? map[o.f] : o.d;
+    el.value = (o.k === "bool") ? (v === "1" ? "1" : "0") : v;
+  });
+  $("dev-result").textContent = "";
+  $("dev-result").className = "hint";
+}
+
+function devSpec() {
+  var parts = [];
+  ALL_DEV.forEach(function (o) {
+    var el = devEl(o.f);
+    if (!el) return;
+    var v = String(el.value).trim();
+    if (o.k === "bool") { if (v === "1") parts.push(o.f + "=1"); return; }
+    if (v === "" || v === o.d) return;                 /* blank or default -> omit */
+    parts.push(o.f + "=" + v);
+  });
+  return parts.join(";");
+}
+
+function resetDev() {
+  ALL_DEV.forEach(function (o) {
+    var el = devEl(o.f);
+    if (!el) return;
+    el.value = (o.k === "bool") ? "0" : o.d;
+  });
+  $("dev-result").textContent = "Reset to defaults — press Save to apply.";
+  $("dev-result").className = "hint";
+}
+
+function saveDev() {
+  if (BUSY) return;
+  var spec = devSpec();
+  /* Charset the module accepts (keeps the option file a pure data file). */
+  if (spec && !/^(--[a-z0-9-]+=[A-Za-z0-9._,:\/+-]+)(;--[a-z0-9-]+=[A-Za-z0-9._,:\/+-]+)*$/.test(spec)) {
+    $("dev-result").textContent = "A value has an unsupported character — use letters, digits, . _ , : / + - only.";
+    $("dev-result").className = "hint err";
+    return;
+  }
+  setBusy(true);
+  $("dev-result").textContent = "Applying…";
+  $("dev-result").className = "hint";
+  ksuExec("sh " + MOD + "/webui.sh setdev " + (spec ? "'" + spec + "'" : "-")).then(function (r) {
+    var s = parseKV(r.stdout);
+    if (r.errno === 0 && s.ok === "1") {
+      $("dev-result").textContent = "Saved. Relay restarted" + (s.pid ? " (pid " + s.pid + ")." : ".");
+      $("dev-result").className = "hint ok";
+      if (typeof ksu !== "undefined" && ksu.toast) ksu.toast("Dev options saved");
+    } else {
+      $("dev-result").textContent = "Failed: " + (s.error || r.stderr || ("exit " + r.errno));
+      $("dev-result").className = "hint err";
+    }
+    refresh();
+  });
+}
+
 document.addEventListener("DOMContentLoaded", function () {
+  renderDev();
   $("btn-save").addEventListener("click", save);
   $("btn-refresh").addEventListener("click", refresh);
   $("btn-test").addEventListener("click", test);
+  $("btn-dev-save").addEventListener("click", saveDev);
+  $("btn-dev-reset").addEventListener("click", resetDev);
   refresh();
 });
 </script>

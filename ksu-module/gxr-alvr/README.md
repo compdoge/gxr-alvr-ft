@@ -68,6 +68,27 @@ echo 41464 > /data/adb/modules/gxr-alvr/mirror
 Set `tongue` to `0` to disable the extra `TongueRoll` parameter (A–B test).
 Both are read at start — tap the **Action** button after changing them.
 
+## Developer options (WebUI)
+
+The WebUI's **Developer options** card exposes the sender's tuning knobs, each
+with a one-line description — the mirror port, TongueRoll gain, and the
+pupil/dilation keys (`--pupil-dilation-gain`, `--pupil-smooth-ms`,
+`--pupil-min-conf`). Change a field and tap **Save & restart relay**; a field left
+at its default is omitted, so future default changes still reach you.
+
+A nested **Advanced — firmware probes** section holds the firmware-specific
+uprobe offsets and plugin paths. They exist so the module can track a firmware
+change without a rebuild, but a wrong value stops face/eye tracking entirely —
+leave them alone unless you know your firmware differs.
+
+It writes the `devopts` file (one `--flag value` per line), which
+`service.sh`/`action.sh` append to the launch command. The file is a **pure data
+file**: values are restricted to `A–Za–z0–9 . _ , : / + - =`, so nothing can
+escape into the shell. **Reset to defaults** clears it.
+
+PC IP, UDP port, TongueRoll and Verbose have their own controls in the
+**Connection** card above.
+
 ## Dev mode (opt-in)
 
 To iterate on the sender without reinstalling the module, create an empty `dev`
@@ -90,13 +111,13 @@ for shipped users.)
 | `gxr_alvr` | the sender (built from `headset/gxr_alvr.c`) |
 | `service.sh` | boot / late-load start |
 | `action.sh` | Manager Action button = restart now |
-| `webui.sh` | helper for the Manager WebUI page (status / set / test) |
-| `webroot/index.html` | the Manager WebUI page (set the PC IP, status, log) |
+| `webui.sh` | helper for the Manager WebUI page (status / set / setdev / test) |
+| `webroot/index.html` | the Manager WebUI page (PC IP, status, log, Developer options) |
 | `customize.sh` | installer permissions + ui_print |
 | `uninstall.sh` | stop the relay on uninstall |
 | `sepolicy.rule` | allow the KernelSU root domain to use tracefs (Enforcing) |
 | `module.prop` | module metadata |
-| `pc`, `port`, `mirror`, `tongue`, `verbose`, `dev` | optional overrides (not shipped; create as needed). **These are preserved across module updates** — the installer copies them into the new version. |
+| `pc`, `port`, `mirror`, `tongue`, `verbose`, `devopts`, `dev` | optional overrides (not shipped; create as needed). **These are preserved across module updates** — the installer copies them into the new version. `devopts` holds the WebUI's Developer-options flags. |
 
 ## Logs
 

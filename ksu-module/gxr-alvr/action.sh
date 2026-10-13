@@ -16,6 +16,13 @@ EXTRA=""
 [ -n "$MIRROR" ] && EXTRA="$EXTRA --mirror-port $MIRROR"
 [ "$TONGUE" = "0" ] && EXTRA="$EXTRA --tongue-extras 0"
 [ -f "$MODDIR/verbose" ] && EXTRA="$EXTRA --verbose"
+if [ -f "$MODDIR/devopts" ]; then
+  if grep -qvE '^(--[a-z0-9-]+( [A-Za-z0-9._,:/+-]+)?)?$' "$MODDIR/devopts"; then
+    echo "gxr-alvr: ignoring devopts (unexpected content)" >>/data/local/tmp/gxr_alvr.log
+  else
+    EXTRA="$EXTRA $(tr '\n' ' ' < "$MODDIR/devopts")"
+  fi
+fi
 
 BIN="$MODDIR/gxr_alvr"
 if [ -f "$MODDIR/dev" ] && [ -x /data/local/tmp/gxr_alvr ]; then
