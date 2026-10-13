@@ -27,7 +27,7 @@ Open **KernelSU Manager → Modules → this module → WebUI** and use the page
   tap **Save & restart relay**. Leave it empty for auto/broadcast.
 - **Test** — ping the PC from the headset to check reachability.
 - **UDP port** — defaults to 41463.
-- **TongueRoll / Verbose** — toggle the extra tongue parameter and the 1 Hz log.
+- **TongueRoll / Verbose** — toggle the extra tongue parameter and the fast tuning log.
 
 The page writes the module's option files (`pc`, `port`, `tongue`, `verbose`) and
 restarts the relay — no adb, no terminal. (If your Manager build has no WebUI
@@ -46,6 +46,28 @@ echo 41463       > /data/adb/modules/gxr-alvr/port   # optional
 ```
 
 Remove `pc` to go back to auto/broadcast. `port` defaults to `41463`.
+
+## If Steam Link (or another stream) stutters or pings spike
+
+The relay sends a steady **60 datagrams/s**, and in auto/broadcast mode it fans
+each one out to every interface's directed broadcast address *plus*
+`255.255.255.255` — i.e. roughly **120 broadcast packets/s (~48 KB/s)**. The
+bandwidth is trivial next to streamed video, but broadcast is expensive airtime:
+Wi-Fi must send it at a low basic rate so every station and the access point
+receives it, it is neither aggregated nor acknowledged, and it keeps the radio
+out of power save. On a latency-sensitive stream such as **Steam Link** that can
+surface as regular ping spikes.
+
+**Fix: set the PC IP (section above).** The relay then unicasts 60 packets/s to
+that one host and the broadcasts stop. There is no downside once you know the
+PC's address — broadcast exists only so the first connection works without typing
+an IP.
+
+To confirm it is the relay and not your Wi-Fi: watch `ping <headset-ip>` (or the
+Steam Link overlay) with the relay running, set the PC IP and press **Save &
+restart relay**, then compare. If the spikes remain, disable the module in the
+Manager and reboot — that separates "broadcast traffic" from "the ftrace probes"
+(the relay holds system-wide uprobes on the perception pipeline).
 
 ## Action button
 
@@ -71,11 +93,15 @@ Both are read at start — tap the **Action** button after changing them.
 ## Developer options (WebUI)
 
 The WebUI's **Developer options** card exposes the sender's tuning knobs, each
-with a one-line description — the mirror port, TongueRoll gain, and the
-eye/dilation keys (`--pupil-dilation-gain`, `--pupil-smooth-ms`,
-`--pupil-min-conf`, `--gaze-hold-open`, `--gaze-smooth-fmin`). Change a field and
-tap **Save & restart relay**; a field left at its default is omitted, so future
-default changes still reach you.
+with a one-line description — the mirror port, TongueRoll gain, the dilation keys
+(`--pupil-dilation-gain`, `--pupil-smooth-ms`, `--pupil-min-conf`) and the gaze
+keys. The gaze keys decide when an eye's direction is *trustworthy*: a
+pitch-guarded blink test plus a pupil test relative to that eye's own recent size
+(`--gaze-lid-low`, `--gaze-pupil-ratio`), a smoothing-only band for a narrowed
+lid that the pupil test cannot see (`--gaze-soft-open`, `--gaze-soft-fmin`), and
+the base filter speed (`--gaze-smooth-fmin`). Change a field and tap **Save &
+restart relay**; a field left at its default is omitted, so future default changes
+still reach you.
 
 A nested **Advanced — firmware probes** section holds the firmware-specific
 uprobe offsets and plugin paths. They exist so the module can track a firmware
@@ -123,7 +149,8 @@ for shipped users.)
 ## Logs
 
 `/data/local/tmp/gxr_alvr.log` (append). The relay also logs `armed …` /
-`auto target …` lines at startup. Pass `--verbose` (dev) for the 1 Hz gaze trace.
+`auto target …` lines at startup. Pass `--verbose` (dev) for the tuning trace
+(~20 Hz gaze, 4 Hz pupil).
 
 ## Notes
 

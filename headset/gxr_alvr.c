@@ -59,7 +59,7 @@
 
 /* Reported in the startup log and by --version, so the running build is always
    identifiable (avoids "is the new binary actually live?" confusion). */
-#define GXR_VERSION "1.3.1"
+#define GXR_VERSION "1.3.5"
 
 #define TRACE "/sys/kernel/tracing"
 #define EYE_PLUGIN "/vendor/lib64/libperception_eye_tracking_host_plugin.so"
@@ -139,19 +139,63 @@ static float PUPIL_SMOOTH_MS = 350.0f;    /* per-eye low-pass time constant (ms)
 #define PUPIL_MIN_MM 1.0f          /* plausible pupil-diameter band (reject junk) */
 #define PUPIL_MAX_MM 9.0f
 
-/* --- gaze conditioning (see the eye-postprocessing RE) ----------------------
+/* --- gaze conditioning (see the eye-postprocessing RE + gaze-reliability-re) --
    The device applies NO gaze filter (its One Euro is FILTER_TYPE_NONE) and has
    no lid->gaze gate, so a partly closed eyelid corrupts the DNN direction and we
    passed that straight through -- the "gaze jitters when I squint" report. We
    therefore run our own per-eye One Euro filter on the raw direction and hold the
-   gaze while that eye's lid is down. Defaults fitted offline to a squint/wink
-   capture (results/gaze-tuning): raw p90 jitter 0.25 -> 0.07 rad/frame with a
-   67/267 ms step response. */
+   gaze while that eye's estimate is untrustworthy.
+
+   WHEN IS IT UNTRUSTWORTHY (v1.3.4). Openness alone cannot decide: the device's
+   face model collapses eyes_closed to 1.0 as a function of GAZE PITCH -- looking
+   down only ~11-23 deg already reports openness 0.00 -- so an openness-only gate
+   froze clean gaze on 48-84% of look-down frames (the "tracking freezes when I
+   look down" report). Pupil size alone cannot decide either: a bright scene
+   legitimately constricts the pupil. Each covers the other's failure mode, and
+   making the pupil test relative to that eye's OWN recent size factors brightness
+   out entirely:
+
+     untrust = (open < BLINK_SHUT && pitch > PITCH_GUARD)  // a real blink
+            || (open < LID_LOW && d_e < RATIO * P90_e)     // occluded pupil
+     soft    = (open < SOFT_OPEN && pitch > PITCH_GUARD)   // partly narrowed lid
+
+   The pitch guard keeps deep look-down (where open reads 0.00) out of both; the
+   relative-pupil test keeps look-down (the pupil stays large) and bright scenes
+   (the lid stays open) out of the squint rule. Validated offline on real captures:
+   look-down false positives 48-84% -> 0-9%, bright scene 0%, blink recall 100% /
+   0 frames latency. See results/gaze-reliability-method.md.
+
+   The third tier exists because the pupil ratio cannot see MILD narrowing: a field
+   capture showed the worst untouched jitter at openness 0.65-0.75 (raw p90 ~14
+   deg/frame) with the pupil still at 0.94 of baseline, so neither rule above fires
+   and the emitted gaze stayed ~4x shakier than when fully open. A narrowed lid
+   therefore just gets smoothed much harder -- not frozen -- which is safe for a
+   droopy or badly fitted baseline (a freeze there would lock the gaze up). */
 #define TWO_PI_F 6.28318531f
-static float GAZE_FMIN = 1.5f;      /* One Euro min cutoff (Hz) */
+static float GAZE_FMIN = 1.5f;      /* One Euro min cutoff while the eye is trusted (Hz) */
 static float GAZE_BETA = 0.01f;     /* One Euro speed coefficient */
 static float GAZE_DCUT = 1.0f;      /* One Euro derivative cutoff (Hz) */
-static float GAZE_HOLD_OPEN = 0.7f; /* freeze that eye's gaze while its lid is below this (0 = off) */
+static float GAZE_BLINK_SHUT = 0.15f;   /* openness below this = the lid is shut */
+static float GAZE_PITCH_GUARD = -20.0f; /* deg; below this we are looking down, so
+                                           eyes_closed is pitch-contaminated and the
+                                           blink rule must not fire. Model-specific
+                                           (measured on I610UEU2AZF3). */
+static float GAZE_LID_LOW = 0.70f;      /* narrowed-lid test for the squint rule */
+static float GAZE_PUPIL_RATIO = 0.55f;  /* d_e below this fraction of the eye's own
+                                           recent pupil = occluded, not constricted */
+static float GAZE_SOFT_OPEN = 0.75f;    /* openness below which the lid is "narrowed":
+                                           smooth much harder (the pupil test can't
+                                           see mild narrowing). Must sit just below the
+                                           eye's resting openness, or the gaze is
+                                           permanently laggy. */
+static float GAZE_SOFT_FMIN = 0.35f;    /* One Euro cutoff used in that band (Hz) */
+#define GAZE_PUPIL_BASE_OPEN 0.85f /* only frames at least this open seed the pupil baseline */
+#define GAZE_PUPIL_WIN_MS 60000    /* rolling window for that baseline */
+#define GAZE_PUPIL_PCT 0.90f       /* P90 (robust to the occasional junk fit) */
+#define GAZE_PUPIL_MIN_N 8         /* samples before the baseline is trusted */
+#define GAZE_PUPIL_SAMPLE_MS 250   /* one baseline sample per pupil frame */
+#define GAZE_DE_HOLD_MS 500        /* hold the last per-eye pupil size this long */
+#define GAZE_PUPIL_RING 256        /* 60 s / 250 ms = 240 samples */
 
 /* A host frame counts as "live" only if it arrived within this window. */
 #define FRESH_MS 500
@@ -590,13 +634,23 @@ static int g_pairHave;
 static long long g_emaMs;       /* last pupil smoothing step (EMA dt) */
 static float g_winMinCand, g_winMaxCand;   /* dwell-confirmed extremes for the dilation envelope */
 static long long g_winMinMs, g_winMaxMs;
-/* per-eye gaze conditioning (One Euro filter + lid hold) */
+/* per-eye gaze conditioning (One Euro filter + trust hold) */
 static float g_gazeS[2][3];     /* filtered direction */
 static float g_gazeDX[2][3];    /* filtered derivative, per axis */
-static float g_gazeOut[2][3];   /* emitted direction (held while that lid is down) */
+static float g_gazeOut[2][3];   /* emitted direction (held while that eye is untrusted) */
 static int g_gazeHave[2];
-static int g_gazeHeld[2];       /* this eye's gaze is currently frozen by the lid gate */
+static int g_gazeHeld[2];       /* this eye's gaze is currently frozen by the trust gate */
+static float g_gazeOpenMax[2];  /* most-open this eye has been, for the baseline threshold */
 static long long g_gazeMs;      /* last gaze conditioning step */
+/* the pupil baseline the occlusion test is relative to */
+static float g_gazePupBase[2];  /* P90 pupil diameter (mm) over the rolling window */
+static float g_gazeDe[2];       /* last per-eye pupil diameter (mm); 0 = never seen */
+static long long g_gazeDeMs[2];
+static float g_gazePupRing[2][GAZE_PUPIL_RING];
+static long long g_gazePupRingMs[2][GAZE_PUPIL_RING];
+static int g_gazePupIdx[2], g_gazePupN[2];
+static long long g_gazePupSampleMs;
+static float g_gazeRatio[2];    /* last computed d_e/base (-1 = pupil unavailable), for the log */
 /* jaw neutral learning (see RootedLinkFTModule.UpdateJaw) */
 static float g_jawHist[JAW_HIST]; static int g_jawN, g_jawIdx; static float g_jawNeutral = 0.2f;
 static long long g_jawNeutralMs;
@@ -871,14 +925,80 @@ static void compute_and_send(void) {
         float dt = (float)(now - g_gazeMs); g_gazeMs = now;
         if (dt <= 0.0f || dt > 500.0f) dt = (float)TX_PERIOD_MS;
         float ad = 1.0f / (1.0f + (1.0f / (TWO_PI_F * fmaxf(GAZE_DCUT, 0.01f))) / dt);
+        /* Per-eye pupil size for the occlusion test, straight from the raw
+           detections -- NOT the conf-filtered dilation path, because the fit
+           confidence is unreliable in this firmware build. Largest candidate per
+           eye, exactly what the offline validation used. A pupil frame is 250 ms
+           old at worst, so the value is held briefly at use time rather than
+           blinking the test on and off. */
+        float gd[2] = { 0.0f, 0.0f };
+        for (int i = 0; i < 4; i++) {                   /* 0/1 = left, 2/3 = right */
+            if (!g_det_ok[i] || (now - g_det_ms[i]) > PUPIL_DET_FRESH_MS) continue;
+            float ax = fmaxf(g_det[i][2], g_det[i][3]);
+            if (ax <= 0.0f) continue;
+            float dd = 2.0f * ax * PUPIL_MM_SCALE;
+            if (dd > gd[i >> 1]) gd[i >> 1] = dd;
+        }
+        for (int e = 0; e < 2; e++)
+            if (gd[e] > 0.0f) { g_gazeDe[e] = gd[e]; g_gazeDeMs[e] = now; }
+        /* Seed the per-eye pupil baseline only from frames where the lid is
+           clearly open and the pupil reads, so a squint, a blink or a bright dip
+           cannot poison it. If this eye simply never opens that far, fall back to
+           its own session best (floored) so a baseline still forms. */
+        if (now - g_gazePupSampleMs >= GAZE_PUPIL_SAMPLE_MS) {
+            g_gazePupSampleMs = now;
+            for (int e = 0; e < 2; e++) {
+                float open_e = haveFace ? (e ? tail[T_ROpen] : tail[T_LOpen]) : 1.0f;
+                float need = fminf(GAZE_PUPIL_BASE_OPEN,
+                                   fmaxf(0.98f * g_gazeOpenMax[e], 0.5f));
+                if (!haveFace || open_e < need || g_gazeDe[e] <= 0.0f) continue;
+                int k = g_gazePupIdx[e];
+                g_gazePupRing[e][k] = g_gazeDe[e];
+                g_gazePupRingMs[e][k] = now;
+                g_gazePupIdx[e] = (k + 1) % GAZE_PUPIL_RING;
+                if (g_gazePupN[e] < GAZE_PUPIL_RING) g_gazePupN[e]++;
+                float tmp[GAZE_PUPIL_RING]; int m = 0;
+                for (int j = 0; j < g_gazePupN[e]; j++) {
+                    int q = (g_gazePupIdx[e] - 1 - j + 2 * GAZE_PUPIL_RING) % GAZE_PUPIL_RING;
+                    if (now - g_gazePupRingMs[e][q] > GAZE_PUPIL_WIN_MS) continue;
+                    tmp[m++] = g_gazePupRing[e][q];
+                }
+                if (m >= GAZE_PUPIL_MIN_N) {
+                    qsort(tmp, m, sizeof(float), cmpf);
+                    g_gazePupBase[e] = tmp[(int)(GAZE_PUPIL_PCT * (m - 1) + 0.5f)];
+                }
+            }
+        }
         for (int e = 0; e < 2; e++) {
             if (!(g_eyedir_mask & (1 << e))) continue;
             const float *d = e ? g_Rdir : g_Ldir;
-            float open = e ? tail[T_ROpen] : tail[T_LOpen];
-            if (haveFace && GAZE_HOLD_OPEN > 0.0f && open < GAZE_HOLD_OPEN && g_gazeHave[e]) {
+            float open = haveFace ? (e ? tail[T_ROpen] : tail[T_LOpen]) : 1.0f;
+            if (haveFace && open > g_gazeOpenMax[e]) g_gazeOpenMax[e] = open;
+            /* Can this eye's direction be believed right now? See the constant
+               block: a pitch-guarded blink test OR a narrowed-lid + occluded-pupil
+               test, each covering the other's false positive. The pitch used here
+               is the raw, un-gated one, so it is still valid while frozen. */
+            float rpitch = atan2f(-d[1], d[2]) * 57.29577951f;   /* + = up, deg */
+            float base = g_gazePupBase[e];
+            float de = (now - g_gazeDeMs[e] <= (long long)GAZE_DE_HOLD_MS) ? g_gazeDe[e] : 0.0f;
+            float ratio = (base > 0.0f && de > 0.0f) ? (de / base) : -1.0f;
+            g_gazeRatio[e] = ratio;
+            int untrust = 0, soft = 0;
+            if (open < GAZE_BLINK_SHUT && rpitch > GAZE_PITCH_GUARD)
+                untrust = 1;                                   /* a real blink */
+            else if (open < GAZE_LID_LOW && ratio >= 0.0f && ratio < GAZE_PUPIL_RATIO)
+                untrust = 1;                                   /* narrow lid + occluded pupil */
+            else if (open < GAZE_SOFT_OPEN && rpitch > GAZE_PITCH_GUARD)
+                soft = 1;      /* narrowed lid, pupil still normal: the DNN direction
+                                  is noisy but we cannot prove it is wrong, so smooth
+                                  hard rather than freeze. The pitch guard keeps this
+                                  off while looking down, where a low openness is pitch
+                                  contamination and the gaze is fine. */
+            if (untrust && g_gazeHave[e]) {
                 g_gazeHeld[e] = 1;                      /* freeze: keep g_gazeOut */
             } else {
                 g_gazeHeld[e] = 0;
+                float fmin = soft ? GAZE_SOFT_FMIN : GAZE_FMIN;
                 if (!g_gazeHave[e]) {
                     for (int a = 0; a < 3; a++) { g_gazeS[e][a] = d[a]; g_gazeDX[e][a] = 0.0f; }
                     g_gazeHave[e] = 1;
@@ -886,7 +1006,7 @@ static void compute_and_send(void) {
                     for (int a = 0; a < 3; a++) {
                         float dx = (d[a] - g_gazeS[e][a]) / dt;
                         g_gazeDX[e][a] = ad * dx + (1.0f - ad) * g_gazeDX[e][a];
-                        float fc = fmaxf(GAZE_FMIN + GAZE_BETA * fabsf(g_gazeDX[e][a]), 0.01f);
+                        float fc = fmaxf(fmin + GAZE_BETA * fabsf(g_gazeDX[e][a]), 0.01f);
                         float fl = 1.0f / (1.0f + (1.0f / (TWO_PI_F * fc)) / dt);
                         g_gazeS[e][a] = fl * d[a] + (1.0f - fl) * g_gazeS[e][a];
                     }
@@ -904,12 +1024,14 @@ static void compute_and_send(void) {
             float lx, ly, rx, ry;
             gaze_map(g_gazeOut[0], &lx, &ly); gaze_map(g_gazeOut[1], &rx, &ry);
             /* Fast per-eye trace. Ldir/Rdir are the RAW device vectors, Lg/Rg the
-               emitted (filtered/held) gaze, held= is the lid gate. */
-            fprintf(stderr, "gxr_alvr: gaze t=%lld ok=%d held=%d%d open=%.3f/%.3f "
+               emitted (filtered/held) gaze, held= is the trust gate, pu= is the
+               pupil size relative to that eye's baseline (-1 = pupil unavailable),
+               so a field capture shows exactly why an eye was gated. */
+            fprintf(stderr, "gxr_alvr: gaze t=%lld ok=%d held=%d%d open=%.3f/%.3f pu=%.2f/%.2f "
                     "Ldir=%+.3f,%+.3f,%+.3f Rdir=%+.3f,%+.3f,%+.3f "
                     "Lg=%+.3f,%+.3f Rg=%+.3f,%+.3f\n",
                     now, g_eyedir_mask, g_gazeHeld[0], g_gazeHeld[1],
-                    tail[T_LOpen], tail[T_ROpen],
+                    tail[T_LOpen], tail[T_ROpen], g_gazeRatio[0], g_gazeRatio[1],
                     g_Ldir[0], g_Ldir[1], g_Ldir[2],
                     g_Rdir[0], g_Rdir[1], g_Rdir[2],
                     lx, ly, rx, ry);
@@ -992,7 +1114,15 @@ static void usage(FILE *f, const char *argv0) {
         "  --pupil-min-conf <f> --pupil-open-gate <f> --pupil-max-jump <f>\n"
         "  --pupil-relock-ms <f>  forget an eye after this long with no reading (default 1500)\n"
         "  --pupil-smooth-ms <f>  per-eye low-pass time constant (default 350)\n"
-        "  --gaze-hold-open <f>   freeze an eye's gaze while its lid is below this (default 0.7, 0=off)\n"
+        "  --gaze-blink-shut <f>  openness below this is a shut lid (default 0.15)\n"
+        "  --gaze-pitch-guard <f> deg; do not read a shut lid as a blink while looking\n"
+        "                         down past this pitch (default -20, model-specific)\n"
+        "  --gaze-lid-low <f>     narrowed-lid threshold for the pupil test (default 0.70)\n"
+        "  --gaze-pupil-ratio <f> a pupil below this fraction of the eye's own recent\n"
+        "                         baseline counts as occluded (default 0.55)\n"
+        "  --gaze-soft-open <f>   below this openness the gaze is smoothed much harder\n"
+        "                         (default 0.75; must sit below the resting openness)\n"
+        "  --gaze-soft-fmin <f>   the cutoff used in that band, Hz (default 0.35)\n"
         "  --gaze-smooth-fmin <f> One Euro gaze filter min cutoff Hz (default 1.5)\n"
         "  --gaze-smooth-beta <f> One Euro speed coefficient (default 0.01)\n"
         "  --gaze-smooth-dcut <f> One Euro derivative cutoff Hz (default 1.0)\n"
@@ -1026,7 +1156,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pupil-max-jump") && i + 1 < argc) PUPIL_MAX_JUMP = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-relock-ms") && i + 1 < argc) PUPIL_RELOCK_MS = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-smooth-ms") && i + 1 < argc) PUPIL_SMOOTH_MS = strtof(argv[++i], NULL);
-        else if (!strcmp(argv[i], "--gaze-hold-open") && i + 1 < argc) GAZE_HOLD_OPEN = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gaze-blink-shut") && i + 1 < argc) GAZE_BLINK_SHUT = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gaze-pitch-guard") && i + 1 < argc) GAZE_PITCH_GUARD = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gaze-lid-low") && i + 1 < argc) GAZE_LID_LOW = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gaze-pupil-ratio") && i + 1 < argc) GAZE_PUPIL_RATIO = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gaze-soft-open") && i + 1 < argc) GAZE_SOFT_OPEN = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gaze-soft-fmin") && i + 1 < argc) GAZE_SOFT_FMIN = strtof(argv[++i], NULL);
+        /* Accepted and ignored (removed in v1.3.4): the openness-only freeze gate was
+           replaced by the blink/pupil trust rule. Still parseable so a devopts file
+           carried across the update cannot brick the relay. */
+        else if (!strcmp(argv[i], "--gaze-hold-open") && i + 1 < argc) i++;
         else if (!strcmp(argv[i], "--gaze-smooth-fmin") && i + 1 < argc) GAZE_FMIN = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--gaze-smooth-beta") && i + 1 < argc) GAZE_BETA = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--gaze-smooth-dcut") && i + 1 < argc) GAZE_DCUT = strtof(argv[++i], NULL);
