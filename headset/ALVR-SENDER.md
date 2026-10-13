@@ -33,12 +33,21 @@ Caveats: broadcast reaches every host on the LAN (a second PC running the module
 
 - **68 → UE** (`FACE68_TO_UE`, 66 pairs) — mirrors `RootedLinkFTModule.Face68Map`.
 - **Un-clamped jaw** — `ue[JawOpen]` overridden from the pre-clamp jaw while the vendor tongue-clamp is active (ported from `RootedLinkFTModule.UpdateJaw`).
-- **Openness** — `1 - clamp(EyesClosed + EyesClosed*Squint)` per eye.
+- **Openness** — `1 - clamp(EyesClosed, 0, 1)` per eye. Face indices 12/13 are the **raw** eyes-closed value: the device folds the lid tightener into it later, in its own `EyeWinkPostprocessor`, and our uprobe reads it before that (RE: `results/eye-postprocessing-re.md`). Folding `EyesClosed*Squint` in here as well saturated openness at `closed ≈ 0.8–0.9` and made the lid snap shut over the last ~20% — so it is emitted raw, and the squint travels separately (face 28/29 → `UE_EyeSquintLeft/Right`).
 - **Pupil** — per eye, smoothed, with a drift-based fallback. The probe's 4 detections are **idx 0/1 = left, 2/3 = right** (confirmed on-device by winking each eye: the closed lid collapses that eye's detections to ~1 mm while the other stays ~4 mm, and the closed eye's detections keep arriving). Each eye's largest candidate is taken (a lid occludes → a smaller fit) and low-pass filtered (`PUPIL_SMOOTH_MS = 350`, because one eye alone is noisier than the two-eye average). A wink is spotted by the eyes disagreeing (hysteresis + a shut lid confirming a collapse); the **open eye then drives the value as its drift from the last both-eyes-open pair average**, so dropping one lid neither *steps* the dilation nor injects that eye's noise. Only a full blink holds (last good value, never 0). The dilation envelope (min/max pupil) is what VRCFT normalizes against — the ALVR module feeds it our window every frame — so it grows **only** from frames where both eyes read cleanly and **both lids are clearly open** (`PUPIL_WINDOW_OPEN = 0.8`), and a new extreme must persist `PUPIL_WINDOW_DWELL_MS (300)` before it is committed. A squint, a blink or bad data (headset briefly off) can therefore no longer widen the window and flatten the whole dilation range. The emitted window is forced to strictly contain the emitted pupil. Tuning: `--pupil-dilation-gain` (raise toward 1.0 for the full range), `--pupil-smooth-ms`, `--pupil-max-jump` (per-eye jump that counts as occlusion), `--pupil-relock-ms` (forget an eye after this long with no reading), `--pupil-open-gate` (per-eye lid threshold), `--pupil-min-conf`.
-- **Gaze** — per-eye `yaw = atan2(x,z)`, `pitch = atan2(-yDown,z)` from the host DNN direction (`0x4be378`).
+- **Gaze** — per-eye `yaw = atan2(x,z)`, `pitch = atan2(-yDown,z)` from the host DNN direction (`0x4be378`), then **conditioned**: each eye's raw direction goes through a **One Euro filter** (per axis; `GAZE_FMIN = 1.5 Hz`, `GAZE_BETA = 0.01`, `GAZE_DCUT = 1.0 Hz`) and is **frozen while that eye's lid is below `GAZE_HOLD_OPEN = 0.7`**. The device does neither — the RE (`results/eye-postprocessing-re.md`) found its own gaze filter reports `FILTER_TYPE_NONE` and there is no lid→gaze gate anywhere — so a partly closed eyelid's corrupted DNN direction used to be forwarded as-is (the "gaze jitters when I squint" report). Replayed over a squint/wink capture this takes the per-frame jitter from p90 0.25 rad to 0.07 rad, with a 67 ms / 267 ms step response. Tuning: `--gaze-hold-open` (0 disables the gate), `--gaze-smooth-fmin`, `--gaze-smooth-beta`, `--gaze-smooth-dcut`.
 - **Tongue** — the 5 basic DOFs come from the 68-vector (face 63–67). `TongueRoll` is derived from the 11-D `predicted_local_tongue_expression` (uprobe `0x358a34`) via the exact 11→5 mapper plus a DOF-leak-free calibration axis (`--tongue-extras`, default on). Shape (Flat/Squish) and Twist were dropped after live testing — the 11-D model can't separate them reliably.
 
 Offsets (firmware `I610UEU2AZF3`): face `0x3589f8`, jaw `0xf09aa4`, eyedir `0x4be378`, pupil `0x4bef60`, tongue `0x358a34`.
+
+## Transmit / link robustness
+
+The sender transmits on **its own clock** (`TX_HZ = 60`), not only when the device
+calls the probed function. Replaying the last computed frame keeps the link alive
+while the perception pipeline idles (headset off, streamed app unfocused, display
+asleep), so the PC/VRCFT never sees the module vanish; after `TX_HOLD_MS = 2000` of
+silence it relaxes the face to neutral and centres the gaze rather than replaying a
+frozen expression. Health/self-heal checks run on their own 3 s cadence.
 
 ## Build / run
 
@@ -52,9 +61,9 @@ tools/build_alvr.sh                      # -> tools/gxr_alvr
 
 ## Flags
 
-`--pc <ip[,ip..]>`, `--port`, `--verbose` (1 Hz gaze trace + a 4 Hz per-detection pupil dump `idx:d<mm>/c<conf>/x<centre>/a<age-ms>`), `--mirror-port`, `--tongue-extras`, `--tongue-gain-roll`, `--pupil-dilation-gain`, `--pupil-min-conf`, `--pupil-smooth-ms`, `--pupil-open-gate`, `--pupil-max-jump`, `--pupil-relock-ms`.
+`--pc <ip[,ip..]>`, `--port`, `--verbose` (a 20 Hz gaze trace `t/ok/held/open/Ldir/Rdir/Lg/Rg` + a 4 Hz per-detection pupil dump `idx:d<mm>/c<conf>/x<centre>/a<age-ms>`), `--mirror-port`, `--tongue-extras`, `--tongue-gain-roll`, `--pupil-dilation-gain`, `--pupil-min-conf`, `--pupil-smooth-ms`, `--pupil-open-gate`, `--pupil-max-jump`, `--pupil-relock-ms`, `--gaze-hold-open`, `--gaze-smooth-fmin`.
 
-Dev-only flags (not exposed in the WebUI; the axis mapping is fixed and verified): `--gaze-swap`, `--gaze-invert-x`, `--gaze-invert-y`, `--tongue-gate`, `--selftest`, and the firmware probes `--pupil-offset`, `--eye-dir-offset`, `--face-bs-offset`, `--jaw-offset`, `--tongue-offset`, `--eye-plugin`, `--face-plugin`. There is **no `--pupil-mm-scale`** any more — the ellipse→mm factor is a fixed constant, because VRCFT normalizes the sent diameter against the window we also send, so the scale cancels out.
+Dev-only flags (not exposed in the WebUI; the axis mapping is fixed and verified): `--gaze-swap`, `--gaze-invert-x`, `--gaze-invert-y`, `--tongue-gate`, `--gaze-smooth-beta`, `--gaze-smooth-dcut`, `--selftest`, and the firmware probes `--pupil-offset`, `--eye-dir-offset`, `--face-bs-offset`, `--jaw-offset`, `--tongue-offset`, `--eye-plugin`, `--face-plugin`. There is **no `--pupil-mm-scale`** any more — the ellipse→mm factor is a fixed constant, because VRCFT normalizes the sent diameter against the window we also send, so the scale cancels out.
 Run `gxr_alvr --help` for the list.
 
 The old runtime `/data/local/tmp/gxr_alvr.conf` (`swap`/`invert_x`/`invert_y`) is **no longer polled**; the now-verified gaze mapping is the compile-time default, and the same knobs are the `--gaze-*` flags above.

@@ -59,7 +59,7 @@
 
 /* Reported in the startup log and by --version, so the running build is always
    identifiable (avoids "is the new binary actually live?" confusion). */
-#define GXR_VERSION "1.2.9"
+#define GXR_VERSION "1.3.1"
 
 #define TRACE "/sys/kernel/tracing"
 #define EYE_PLUGIN "/vendor/lib64/libperception_eye_tracking_host_plugin.so"
@@ -133,10 +133,25 @@ static float PUPIL_SMOOTH_MS = 350.0f;    /* per-eye low-pass time constant (ms)
 #define PUPIL_GAIN_MIN 0.05f       /* floor on the dilation gain divisor */
 #define PUPIL_DET_FRESH_MS 250     /* a detection older than this is stale */
 #define PUPIL_LOG_MS 250           /* --verbose pupil line cadence (fast, to catch a wink) */
+#define GAZE_LOG_MS 50             /* --verbose gaze line cadence (fast, to measure jitter) */
 #define PUPIL_EYE_GAP 1.5f         /* one eye this far (mm) below the other = a lid is occluding it */
 #define PUPIL_EYE_CLEAR 0.6f       /* ...and occlusion clears once they are this close again (hysteresis) */
 #define PUPIL_MIN_MM 1.0f          /* plausible pupil-diameter band (reject junk) */
 #define PUPIL_MAX_MM 9.0f
+
+/* --- gaze conditioning (see the eye-postprocessing RE) ----------------------
+   The device applies NO gaze filter (its One Euro is FILTER_TYPE_NONE) and has
+   no lid->gaze gate, so a partly closed eyelid corrupts the DNN direction and we
+   passed that straight through -- the "gaze jitters when I squint" report. We
+   therefore run our own per-eye One Euro filter on the raw direction and hold the
+   gaze while that eye's lid is down. Defaults fitted offline to a squint/wink
+   capture (results/gaze-tuning): raw p90 jitter 0.25 -> 0.07 rad/frame with a
+   67/267 ms step response. */
+#define TWO_PI_F 6.28318531f
+static float GAZE_FMIN = 1.5f;      /* One Euro min cutoff (Hz) */
+static float GAZE_BETA = 0.01f;     /* One Euro speed coefficient */
+static float GAZE_DCUT = 1.0f;      /* One Euro derivative cutoff (Hz) */
+static float GAZE_HOLD_OPEN = 0.7f; /* freeze that eye's gaze while its lid is below this (0 = off) */
 
 /* A host frame counts as "live" only if it arrived within this window. */
 #define FRESH_MS 500
@@ -162,7 +177,7 @@ static float PUPIL_SMOOTH_MS = 350.0f;    /* per-eye low-pass time constant (ms)
 static volatile sig_atomic_t g_stop = 0;
 static void on_sig(int s) { (void)s; g_stop = 1; }
 
-/* If set, print the 1 Hz gaze trace to stderr (default: quiet). */
+/* If set, print the fast gaze trace + pupil dump to stderr (default: quiet). */
 static int g_verbose = 0;
 
 /* Gaze mapping knobs. Defaults (0/0/0) are the verified-correct mapping:
@@ -575,9 +590,48 @@ static int g_pairHave;
 static long long g_emaMs;       /* last pupil smoothing step (EMA dt) */
 static float g_winMinCand, g_winMaxCand;   /* dwell-confirmed extremes for the dilation envelope */
 static long long g_winMinMs, g_winMaxMs;
+/* per-eye gaze conditioning (One Euro filter + lid hold) */
+static float g_gazeS[2][3];     /* filtered direction */
+static float g_gazeDX[2][3];    /* filtered derivative, per axis */
+static float g_gazeOut[2][3];   /* emitted direction (held while that lid is down) */
+static int g_gazeHave[2];
+static int g_gazeHeld[2];       /* this eye's gaze is currently frozen by the lid gate */
+static long long g_gazeMs;      /* last gaze conditioning step */
 /* jaw neutral learning (see RootedLinkFTModule.UpdateJaw) */
 static float g_jawHist[JAW_HIST]; static int g_jawN, g_jawIdx; static float g_jawNeutral = 0.2f;
 static long long g_jawNeutralMs;
+
+/* ---------------- transmit ----------------
+   The sender used to transmit ONLY when the device called the probed face
+   function, so whenever the perception pipeline went idle (headset off, streamed
+   app unfocused, display asleep) we fell completely silent and the PC/VRCFT saw
+   the module vanish -- the "face tracking stops after every test" report. We now
+   transmit on our own clock: replay the last computed frame, and relax the face
+   to neutral if the device stays quiet for a while. */
+#define TX_HZ 60                        /* steady datagram rate */
+#define TX_PERIOD_MS (1000 / TX_HZ)
+#define TX_HOLD_MS 2000                 /* replay the last frame this long, then relax */
+static float g_ue[UE_MAX], g_tail[TAIL_N];   /* last computed frame */
+static int g_stateOk;                        /* a frame has been computed */
+static long long g_lastTxMs, g_lastDataMs;   /* last datagram sent / last device upline */
+
+static void tx_send(void) {
+    long long now = now_ms();
+    if (!g_stateOk) return;
+    if (now - g_lastDataMs > TX_HOLD_MS) {
+        /* Device has gone quiet: send a relaxed, forward-looking frame rather than
+           replaying a frozen expression -- but keep the link alive either way. */
+        float ue2[UE_MAX]; memset(ue2, 0, sizeof(ue2));
+        float t2[TAIL_N]; memcpy(t2, g_tail, sizeof(t2));
+        t2[T_LOpen] = 1.0f; t2[T_ROpen] = 1.0f;
+        t2[T_LPitch] = 0.0f; t2[T_LYaw] = 0.0f;
+        t2[T_RPitch] = 0.0f; t2[T_RYaw] = 0.0f;
+        send_uniexpr(ue2, t2);
+    } else {
+        send_uniexpr(g_ue, g_tail);
+    }
+    g_lastTxMs = now;
+}
 
 static int cmpf(const void *a, const void *b) {
     float x = *(const float *)a, y = *(const float *)b;
@@ -619,7 +673,7 @@ static float tongue_readout(const float x[TONGUE_IN], const float dof[TONGUE_DOF
 
 static void compute_and_send(void) {
     long long now = now_ms();
-    float ue[UE_MAX]; memset(ue, 0, sizeof(ue));
+    float *ue = g_ue, *tail = g_tail; memset(ue, 0, sizeof(g_ue));
 
     /* 1) 68 -> UE */
     int haveFace = (now - g_face_ms) <= FRESH_MS;
@@ -655,13 +709,21 @@ static void compute_and_send(void) {
     }
 
     /* 4) tail */
-    float tail[TAIL_N]; memset(tail, 0, sizeof(tail));
+    memset(tail, 0, sizeof(g_tail));
     tail[T_Version] = 1.0f;
 
     if (haveFace) {
+        /* eyes_closed (face 12/13) is the raw value: the device folds the lid
+           tightener into it later, in its own EyeWinkPostprocessor, and our uprobe
+           reads it BEFORE that. Verified by RE: raw eyes_closed reaches exactly
+           1.0 on a full closure (results/eye-postprocessing-re.md). Folding the
+           squint in here as well saturated openness at closed~=0.8-0.9, which is
+           what made the lid snap shut over the last ~20%. Emit the raw openness;
+           the squint still travels as its own expression (FACE68_TO_UE maps face
+           28/29 -> UE_EyeSquint{Left,Right}). */
         float closedL = g_face[F_EYES_CLOSED_L], closedR = g_face[F_EYES_CLOSED_R];
-        tail[T_LOpen] = 1.0f - clampf(closedL + closedL * ue[UE_EyeSquintLeft], 0.0f, 1.0f);
-        tail[T_ROpen] = 1.0f - clampf(closedR + closedR * ue[UE_EyeSquintRight], 0.0f, 1.0f);
+        tail[T_LOpen] = 1.0f - clampf(closedL, 0.0f, 1.0f);
+        tail[T_ROpen] = 1.0f - clampf(closedR, 0.0f, 1.0f);
     }
 
     /* 3b) pupil: per eye, smoothed, with a drift-based fallback so a wink no
@@ -798,30 +860,59 @@ static void compute_and_send(void) {
 
     int haveEye = (now - g_eyedir_ms) <= FRESH_MS;
     if (haveEye) {
-        // The module maps Gaze.x <- the T_*Pitch slot and Gaze.y <- the T_*Yaw
-        // slot, and VRCFT's Gaze.x is HORIZONTAL / Gaze.y VERTICAL. So yaw must
-        // go into the *Pitch* slot and pitch into the *Yaw* slot; the straight
-        // assignment came out rotated 90 deg (up->right, right->up).
-        float gx, gy;
-        if (g_eyedir_mask & 1) {
-            gaze_map(g_Ldir, &gx, &gy);
-            tail[T_LPitch] = gx;   // module: Gaze.x <- the T_LPitch slot
-            tail[T_LYaw]   = gy;   // module: Gaze.y <- the T_LYaw slot
-        }
-        if (g_eyedir_mask & 2) {
-            gaze_map(g_Rdir, &gx, &gy);
-            tail[T_RPitch] = gx;
-            tail[T_RYaw]   = gy;
+        /* The module maps Gaze.x <- the T_*Pitch slot and Gaze.y <- the T_*Yaw
+           slot, and VRCFT's Gaze.x is HORIZONTAL / Gaze.y VERTICAL. So yaw must
+           go into the *Pitch* slot and pitch into the *Yaw* slot; the straight
+           assignment came out rotated 90 deg (up->right, right->up).
+           Before mapping, each eye's raw direction is One-Euro filtered and then
+           held while that eye's lid is down: the device does neither (its gaze
+           filter is FILTER_TYPE_NONE and it has no lid gate), so a partly closed
+           eyelid's corrupted direction used to go straight out. */
+        float dt = (float)(now - g_gazeMs); g_gazeMs = now;
+        if (dt <= 0.0f || dt > 500.0f) dt = (float)TX_PERIOD_MS;
+        float ad = 1.0f / (1.0f + (1.0f / (TWO_PI_F * fmaxf(GAZE_DCUT, 0.01f))) / dt);
+        for (int e = 0; e < 2; e++) {
+            if (!(g_eyedir_mask & (1 << e))) continue;
+            const float *d = e ? g_Rdir : g_Ldir;
+            float open = e ? tail[T_ROpen] : tail[T_LOpen];
+            if (haveFace && GAZE_HOLD_OPEN > 0.0f && open < GAZE_HOLD_OPEN && g_gazeHave[e]) {
+                g_gazeHeld[e] = 1;                      /* freeze: keep g_gazeOut */
+            } else {
+                g_gazeHeld[e] = 0;
+                if (!g_gazeHave[e]) {
+                    for (int a = 0; a < 3; a++) { g_gazeS[e][a] = d[a]; g_gazeDX[e][a] = 0.0f; }
+                    g_gazeHave[e] = 1;
+                } else {
+                    for (int a = 0; a < 3; a++) {
+                        float dx = (d[a] - g_gazeS[e][a]) / dt;
+                        g_gazeDX[e][a] = ad * dx + (1.0f - ad) * g_gazeDX[e][a];
+                        float fc = fmaxf(GAZE_FMIN + GAZE_BETA * fabsf(g_gazeDX[e][a]), 0.01f);
+                        float fl = 1.0f / (1.0f + (1.0f / (TWO_PI_F * fc)) / dt);
+                        g_gazeS[e][a] = fl * d[a] + (1.0f - fl) * g_gazeS[e][a];
+                    }
+                }
+                for (int a = 0; a < 3; a++) g_gazeOut[e][a] = g_gazeS[e][a];
+            }
+            float gx, gy;
+            gaze_map(g_gazeOut[e], &gx, &gy);
+            if (e == 0) { tail[T_LPitch] = gx; tail[T_LYaw] = gy; }
+            else        { tail[T_RPitch] = gx; tail[T_RYaw] = gy; }
         }
         static long long lastlog = 0;
-        if (g_verbose && now - lastlog > 1000) {
+        if (g_verbose && now - lastlog >= GAZE_LOG_MS) {
             lastlog = now;
             float lx, ly, rx, ry;
-            gaze_map(g_Ldir, &lx, &ly); gaze_map(g_Rdir, &rx, &ry);
-            fprintf(stderr, "gxr_alvr: gaze Ldir=(%+.2f,%+.2f,%+.2f) Gaze.x=%+.3f Gaze.y=%+.3f "
-                    "| Rdir=(%+.2f,%+.2f,%+.2f) Gaze.x=%+.3f Gaze.y=%+.3f | swap=%d inv_x=%d inv_y=%d\n",
-                    g_Ldir[0], g_Ldir[1], g_Ldir[2], lx, ly,
-                    g_Rdir[0], g_Rdir[1], g_Rdir[2], rx, ry, g_swap, g_inv_x, g_inv_y);
+            gaze_map(g_gazeOut[0], &lx, &ly); gaze_map(g_gazeOut[1], &rx, &ry);
+            /* Fast per-eye trace. Ldir/Rdir are the RAW device vectors, Lg/Rg the
+               emitted (filtered/held) gaze, held= is the lid gate. */
+            fprintf(stderr, "gxr_alvr: gaze t=%lld ok=%d held=%d%d open=%.3f/%.3f "
+                    "Ldir=%+.3f,%+.3f,%+.3f Rdir=%+.3f,%+.3f,%+.3f "
+                    "Lg=%+.3f,%+.3f Rg=%+.3f,%+.3f\n",
+                    now, g_eyedir_mask, g_gazeHeld[0], g_gazeHeld[1],
+                    tail[T_LOpen], tail[T_ROpen],
+                    g_Ldir[0], g_Ldir[1], g_Ldir[2],
+                    g_Rdir[0], g_Rdir[1], g_Rdir[2],
+                    lx, ly, rx, ry);
         }
     }
 
@@ -840,7 +931,7 @@ static void compute_and_send(void) {
         }
     }
 
-    send_uniexpr(ue, tail);
+    g_stateOk = 1;                 /* tx_send() transmits at the steady rate */
 }
 
 static void feed_line(const char *line) {
@@ -850,6 +941,7 @@ static void feed_line(const char *line) {
     float jv[4];
     float tv[TONGUE_N];
 
+    g_lastDataMs = now_ms();       /* any device upline keeps the link in "hold" mode */
     if (parse_dir(line, &eye, d) == 0) {
         if (eye == 0) { memcpy(g_Ldir, d, 12); g_eyedir_mask |= 1; }
         else          { memcpy(g_Rdir, d, 12); g_eyedir_mask |= 2; }
@@ -886,7 +978,7 @@ static void usage(FILE *f, const char *argv0) {
         "Usage: %s [--pc <ip>] [--port <n>] [options]\n"
         "  --pc <ip[,ip..]>     fixed unicast target(s) (default: auto broadcast)\n"
         "  --port <n>           UDP target port (default 41463)\n"
-        "  --verbose            log the 1 Hz gaze trace for tuning\n"
+        "  --verbose            fast gaze trace + pupil dump for tuning\n"
         "  --gaze-swap 0|1      swap gaze axes (default 0)\n"
         "  --gaze-invert-x 0|1  invert Gaze.x (default 0)\n"
         "  --gaze-invert-y 0|1  invert Gaze.y (default 0)\n"
@@ -900,6 +992,10 @@ static void usage(FILE *f, const char *argv0) {
         "  --pupil-min-conf <f> --pupil-open-gate <f> --pupil-max-jump <f>\n"
         "  --pupil-relock-ms <f>  forget an eye after this long with no reading (default 1500)\n"
         "  --pupil-smooth-ms <f>  per-eye low-pass time constant (default 350)\n"
+        "  --gaze-hold-open <f>   freeze an eye's gaze while its lid is below this (default 0.7, 0=off)\n"
+        "  --gaze-smooth-fmin <f> One Euro gaze filter min cutoff Hz (default 1.5)\n"
+        "  --gaze-smooth-beta <f> One Euro speed coefficient (default 0.01)\n"
+        "  --gaze-smooth-dcut <f> One Euro derivative cutoff Hz (default 1.0)\n"
         "  --pupil-offset <hex> --eye-dir-offset <hex>\n"
         "  --face-bs-offset <hex> --jaw-offset <hex> --tongue-offset <hex>\n"
         "  --eye-plugin <path> --face-plugin <path>\n",
@@ -930,6 +1026,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pupil-max-jump") && i + 1 < argc) PUPIL_MAX_JUMP = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-relock-ms") && i + 1 < argc) PUPIL_RELOCK_MS = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-smooth-ms") && i + 1 < argc) PUPIL_SMOOTH_MS = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gaze-hold-open") && i + 1 < argc) GAZE_HOLD_OPEN = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gaze-smooth-fmin") && i + 1 < argc) GAZE_FMIN = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gaze-smooth-beta") && i + 1 < argc) GAZE_BETA = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gaze-smooth-dcut") && i + 1 < argc) GAZE_DCUT = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--pupil-offset") && i + 1 < argc) pupil_off = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--eye-dir-offset") && i + 1 < argc) eyedir_off = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--face-bs-offset") && i + 1 < argc) face_off = strtoul(argv[++i], NULL, 0);
@@ -1038,27 +1138,35 @@ int main(int argc, char **argv) {
     char buf[65536]; static char line[8192]; size_t carry = 0;
     struct pollfd pfd;
     pfd.fd = fd; pfd.events = POLLIN;
+    long long nextHealth = now_ms() + SOCK_POLL_MS;
     while (!g_stop) {
-        int pr = poll(&pfd, 1, SOCK_POLL_MS);
+        /* A short poll timeout so the steady transmit tick runs on our own clock
+           even while the device is silent (see tx_send). */
+        int pr = poll(&pfd, 1, TX_PERIOD_MS);
         if (pr < 0) { if (errno == EINTR) continue; break; }
-        if (pr == 0) { health_check(); refresh_target(); continue; }
-        ssize_t n = read(fd, buf, sizeof(buf));
-        if (n < 0) { if (errno == EINTR) continue; break; }
-        if (n == 0) continue;
-        size_t start = 0;
-        for (ssize_t i = 0; i < n; i++) {
-            if (buf[i] != '\n') continue;
-            size_t seg = (size_t)i - start;
-            if (carry + seg < sizeof(line)) {
-                memcpy(line + carry, buf + start, seg);
-                line[carry + seg] = '\0';
-                feed_line(line);
+        if (pr > 0) {
+            ssize_t n = read(fd, buf, sizeof(buf));
+            if (n < 0) { if (errno == EINTR) continue; break; }
+            if (n > 0) {
+                size_t start = 0;
+                for (ssize_t i = 0; i < n; i++) {
+                    if (buf[i] != '\n') continue;
+                    size_t seg = (size_t)i - start;
+                    if (carry + seg < sizeof(line)) {
+                        memcpy(line + carry, buf + start, seg);
+                        line[carry + seg] = '\0';
+                        feed_line(line);
+                    }
+                    carry = 0; start = (size_t)i + 1;
+                }
+                size_t rem = (size_t)n - start;
+                if (rem >= sizeof(line)) rem = sizeof(line) - 1;
+                memcpy(line, buf + start, rem); carry = rem;
             }
-            carry = 0; start = (size_t)i + 1;
         }
-        size_t rem = (size_t)n - start;
-        if (rem >= sizeof(line)) rem = sizeof(line) - 1;
-        memcpy(line, buf + start, rem); carry = rem;
+        long long tnow = now_ms();
+        if (tnow - g_lastTxMs >= TX_PERIOD_MS) tx_send();
+        if (tnow >= nextHealth) { nextHealth = tnow + SOCK_POLL_MS; health_check(); refresh_target(); }
     }
 
     close(fd);

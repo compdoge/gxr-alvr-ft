@@ -275,7 +275,9 @@ var DEVOPTS = [
   { f:"--tongue-gain-roll", d:"3", k:"num", t:"TongueRoll scale factor." },
   { f:"--pupil-dilation-gain", d:"0.75", k:"num", t:"Widens the dilation window by 1/gain. Raise toward 1.0 for a wider, more sensitive dilation range." },
   { f:"--pupil-smooth-ms", d:"350", k:"num", t:"Per-eye low-pass time constant. Higher = steadier but slower to follow." },
-  { f:"--pupil-min-conf", d:"0.25", k:"num", t:"Ignore pupil detections whose confidence is below this." }
+  { f:"--pupil-min-conf", d:"0.25", k:"num", t:"Ignore pupil detections whose confidence is below this." },
+  { f:"--gaze-hold-open", d:"0.7", k:"num", t:"Freeze an eye's gaze while its eyelid is below this openness (0 = off). This is what stops the gaze jittering when you squint." },
+  { f:"--gaze-smooth-fmin", d:"1.5", k:"num", t:"Gaze smoothing (One Euro filter min cutoff, Hz). Higher = snappier but noisier; lower = steadier but laggier." }
 ];
 
 /* Firmware-specific probes, kept so the module can follow a firmware change

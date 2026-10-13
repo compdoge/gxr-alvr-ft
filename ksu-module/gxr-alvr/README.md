@@ -72,9 +72,10 @@ Both are read at start — tap the **Action** button after changing them.
 
 The WebUI's **Developer options** card exposes the sender's tuning knobs, each
 with a one-line description — the mirror port, TongueRoll gain, and the
-pupil/dilation keys (`--pupil-dilation-gain`, `--pupil-smooth-ms`,
-`--pupil-min-conf`). Change a field and tap **Save & restart relay**; a field left
-at its default is omitted, so future default changes still reach you.
+eye/dilation keys (`--pupil-dilation-gain`, `--pupil-smooth-ms`,
+`--pupil-min-conf`, `--gaze-hold-open`, `--gaze-smooth-fmin`). Change a field and
+tap **Save & restart relay**; a field left at its default is omitted, so future
+default changes still reach you.
 
 A nested **Advanced — firmware probes** section holds the firmware-specific
 uprobe offsets and plugin paths. They exist so the module can track a firmware
