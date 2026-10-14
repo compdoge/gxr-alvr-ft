@@ -67,11 +67,11 @@
   <div class="sub">Headset-side sender for the VRCFT-ALVR-UE module &middot; UDP 41463</div>
 
   <div class="card">
-    <h2>Status <span id="bridge" class="pill">connecting…</span></h2>
+    <h2>Status <span id="bridge" class="pill">connecting...</span></h2>
     <dl>
-      <dt>Target</dt><dd id="s-armed" class="mono">—</dd>
-      <dt>Relay pid</dt><dd id="s-pid" class="mono">—</dd>
-      <dt>Headset IP</dt><dd id="s-ip" class="mono">—</dd>
+      <dt>Target</dt><dd id="s-armed" class="mono">-</dd>
+      <dt>Relay pid</dt><dd id="s-pid" class="mono">-</dd>
+      <dt>Headset IP</dt><dd id="s-ip" class="mono">-</dd>
     </dl>
   </div>
 
@@ -84,7 +84,7 @@
       <button id="btn-test" title="Ping the entered IP from the headset">Test</button>
     </div>
     <div class="hint">Leave empty for auto-connect (LAN broadcast). If the link drops often
-      (Wi-Fi access points frequently filter broadcast), enter the PC's IPv4 address here —
+      (Wi-Fi access points frequently filter broadcast), enter the PC's IPv4 address here -
       the PC running VRCFaceTracking.</div>
     <div id="test-result" class="hint"></div>
 
@@ -123,7 +123,7 @@
 
   <div class="card">
     <h2>Log tail</h2>
-    <pre id="s-log">—</pre>
+    <pre id="s-log">-</pre>
   </div>
 
 <script>
@@ -198,8 +198,8 @@ function refresh() {
     $("s-armed").textContent = s.armed || "(no startup line yet)";
     $("s-pid").textContent = s.pid || "(not running)";
     $("s-pid").className = s.pid ? "mono ok" : "mono err";
-    $("s-ip").textContent = (s.ip || "").replace(/,+$/, "") || "—";
-    $("s-log").textContent = (s.tail || "—").split("~").join("\n");
+    $("s-ip").textContent = (s.ip || "").replace(/,+$/, "") || "-";
+    $("s-log").textContent = (s.tail || "-").split("~").join("\n");
     setBusy(false);
   });
 }
@@ -219,7 +219,7 @@ function save() {
     return;
   }
   if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
-    $("save-result").textContent = "Enter a valid port (1–65535).";
+    $("save-result").textContent = "Enter a valid port (1-65535).";
     $("save-result").className = "hint err";
     return;
   }
@@ -227,7 +227,7 @@ function save() {
   var cmd = "sh " + MOD + "/webui.sh set " + pcArg + " " + port + " " +
             ($("tongue").checked ? "1" : "0") + " " + ($("verbose").checked ? "1" : "0");
   setBusy(true);
-  $("save-result").textContent = "Applying…";
+  $("save-result").textContent = "Applying...";
   $("save-result").className = "hint";
   ksuExec(cmd).then(function (r) {
     var s = parseKV(r.stdout);
@@ -253,7 +253,7 @@ function test() {
   }
   if (pc === "") return;
   setBusy(true);
-  $("test-result").textContent = "Pinging " + pc + "…";
+  $("test-result").textContent = "Pinging " + pc + "...";
   $("test-result").className = "hint";
   ksuExec("sh " + MOD + "/webui.sh test " + pc).then(function (r) {
     var s = parseKV(r.stdout);
@@ -261,7 +261,7 @@ function test() {
       $("test-result").textContent = pc + " is reachable from the headset.";
       $("test-result").className = "hint ok";
     } else {
-      $("test-result").textContent = pc + " did not answer a ping (may still work — a PC can block ICMP).";
+      $("test-result").textContent = pc + " did not answer a ping (may still work - a PC can block ICMP).";
       $("test-result").className = "hint warn";
     }
     setBusy(false);
@@ -372,7 +372,7 @@ function resetDev() {
     if (!el) return;
     el.value = (o.k === "bool") ? "0" : o.d;
   });
-  $("dev-result").textContent = "Reset to defaults — press Save to apply.";
+  $("dev-result").textContent = "Reset to defaults - press Save to apply.";
   $("dev-result").className = "hint";
 }
 
@@ -381,12 +381,12 @@ function saveDev() {
   var spec = devSpec();
   /* Charset the module accepts (keeps the option file a pure data file). */
   if (spec && !/^(--[a-z0-9-]+=[A-Za-z0-9._,:\/+-]+)(;--[a-z0-9-]+=[A-Za-z0-9._,:\/+-]+)*$/.test(spec)) {
-    $("dev-result").textContent = "A value has an unsupported character — use letters, digits, . _ , : / + - only.";
+    $("dev-result").textContent = "A value has an unsupported character - use letters, digits, . _ , : / + - only.";
     $("dev-result").className = "hint err";
     return;
   }
   setBusy(true);
-  $("dev-result").textContent = "Applying…";
+  $("dev-result").textContent = "Applying...";
   $("dev-result").className = "hint";
   ksuExec("sh " + MOD + "/webui.sh setdev " + (spec ? "'" + spec + "'" : "-")).then(function (r) {
     var s = parseKV(r.stdout);

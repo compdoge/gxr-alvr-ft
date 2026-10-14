@@ -49,6 +49,8 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <time.h>
 #include <unistd.h>
@@ -59,7 +61,7 @@
 
 /* Reported in the startup log and by --version, so the running build is always
    identifiable (avoids "is the new binary actually live?" confusion). */
-#define GXR_VERSION "1.3.6"
+#define GXR_VERSION "1.3.7"
 
 #define TRACE "/sys/kernel/tracing"
 #define EYE_PLUGIN "/vendor/lib64/libperception_eye_tracking_host_plugin.so"
@@ -682,6 +684,25 @@ static int tx_period_ms(void) {
     if (h > 240) h = 240;
     return 1000 / h;
 }
+
+/* ---------------- liveness / diagnostics ----------------
+   The relay used to log only when the device fed it, so "no data", "the reader
+   wedged" and "the process died" were indistinguishable in the log -- which is
+   what made the VD freezes hard to pin down. The heartbeat below is written from
+   the main loop itself, so it keeps appearing even when nothing probes. */
+#define HB_MS 15000                     /* heartbeat cadence (always on) */
+#define HB_SLOW_MS 300000               /* ...and once the log has passed the cap */
+#define STALL_MS 3000                   /* no probe event for this long = stalled */
+#define STALL_REARM_MS 60000            /* re-arm at most this often while stalled */
+#define WATCHDOG_MS 5000                /* no main-loop progress this long -> exit */
+#define LOG_CAP_BYTES (4 * 1024 * 1024) /* verbose switches itself off past this */
+static long long g_loopTickMs;          /* last main-loop progress (watchdog) */
+static long long g_lastRearmMs;         /* last stall-triggered re-arm */
+static long long g_evCount;             /* OUR probe events parsed */
+static long long g_txCount;             /* datagrams sent */
+static int g_stallCount;                /* stall-triggered re-arms so far */
+static int g_stallActive;               /* already re-armed for this stall episode */
+static int g_hbMs = HB_MS;              /* heartbeat interval, slowed past the cap */
 static float g_ue[UE_MAX], g_tail[TAIL_N];   /* last computed frame */
 static int g_stateOk;                        /* a frame has been computed */
 static long long g_lastTxMs, g_lastDataMs;   /* last datagram sent / last device upline */
@@ -701,6 +722,7 @@ static void tx_send(void) {
     } else {
         send_uniexpr(g_ue, g_tail);
     }
+    g_txCount++;
     g_lastTxMs = now;
 }
 
@@ -1073,32 +1095,36 @@ static void compute_and_send(void) {
     g_stateOk = 1;                 /* tx_send() transmits at the steady rate */
 }
 
-static void feed_line(const char *line) {
+/* Returns 1 if the line was one of OUR probe events, 0 otherwise. trace_pipe is
+   the GLOBAL pipe: when anything else has tracefs events enabled (a capture
+   script, a vendor tracer) its lines land here too. Counting and timestamping
+   only our own events keeps the heartbeat, the stall detector and the transmit
+   hold honest -- a foreign event must not look like the device feeding us. */
+static int feed_line(const char *line) {
     int idx; float v[6];
     int eye; float d[3];
     float fv[FACE_N];
     float jv[4];
     float tv[TONGUE_N];
 
-    g_lastDataMs = now_ms();       /* any device upline keeps the link in "hold" mode */
     if (parse_dir(line, &eye, d) == 0) {
         if (eye == 0) { memcpy(g_Ldir, d, 12); g_eyedir_mask |= 1; }
         else          { memcpy(g_Rdir, d, 12); g_eyedir_mask |= 2; }
         g_eyedir_ms = now_ms();
-        return;
+        return 1;
     }
     if (parse_bs(line, fv) == 0) {
         memcpy(g_face, fv, sizeof(fv)); g_face_ms = now_ms();
         compute_and_send();
-        return;
+        return 1;
     }
     if (parse_jaw(line, jv) == 0) {
         memcpy(g_jaw, jv, sizeof(jv)); g_jaw_ms = now_ms();
-        return;
+        return 1;
     }
     if (parse_tongue(line, tv) == 0) {
         memcpy(g_tongue, tv, sizeof(tv)); g_tongue_ms = now_ms();
-        return;
+        return 1;
     }
     if (parse_pten(line, &idx, v) == 0) {
         if (idx >= 0 && idx < MAX_DET) {
@@ -1108,8 +1134,9 @@ static void feed_line(const char *line) {
             g_det_ok[idx] = 1;
         }
         g_pupil_ms = now_ms();
-        return;
+        return 1;
     }
+    return 0;
 }
 
 static void usage(FILE *f, const char *argv0) {
@@ -1150,6 +1177,21 @@ static void usage(FILE *f, const char *argv0) {
         "  --face-bs-offset <hex> --jaw-offset <hex> --tongue-offset <hex>\n"
         "  --eye-plugin <path> --face-plugin <path>\n",
         argv0);
+}
+
+/* Watchdog. The loop cannot notice its own stall, so the timer does: if the main
+   loop has not progressed for WATCHDOG_MS, log it and exit. Exiting is the right
+   recovery because the module runs the relay under a supervisor that starts it
+   again -- a frozen relay helps nobody and the PC only sees a short gap.
+   Async-signal-safe only: clock_gettime, write, _exit. */
+static void on_alarm(int s) {
+    (void)s;
+    if (now_ms() - g_loopTickMs > WATCHDOG_MS) {
+        static const char msg[] = "gxr_alvr: watchdog: main loop stalled; exiting so the supervisor can restart\n";
+        ssize_t w = write(2, msg, sizeof(msg) - 1);
+        (void)w;
+        _exit(1);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -1292,13 +1334,28 @@ int main(int argc, char **argv) {
             GXR_VERSION, pupil_off, eyedir_off, face_off, jaw_off, tongue_off, target, port,
             g_have_mirror ? " +mirror" : "");
 
-    int fd = open(TRACE "/trace_pipe", O_RDONLY);
+    /* O_NONBLOCK matters: trace_pipe is a CONSUMING read, so a poll() that said
+       "readable" can still find nothing for us. A blocking read here once parked
+       this process forever -- taking the transmit tick and the health check down
+       with it, so the face froze at the last frame and only a new event (an app
+       switch) could unwedge it. Never block in this loop. */
+    int fd = open(TRACE "/trace_pipe", O_RDONLY | O_NONBLOCK);
     if (fd < 0) { fprintf(stderr, "gxr_alvr: open trace_pipe: %s\n", strerror(errno)); disarm_all(); return 4; }
 
     char buf[65536]; static char line[8192]; size_t carry = 0;
     struct pollfd pfd;
     pfd.fd = fd; pfd.events = POLLIN;
     long long nextHealth = now_ms() + SOCK_POLL_MS;
+    long long nextHb = now_ms() + HB_MS;
+    /* Arm the watchdog now that nothing else can delay us before the loop. */
+    g_loopTickMs = now_ms();
+    struct sigaction sw; memset(&sw, 0, sizeof(sw));
+    sw.sa_handler = on_alarm; sigemptyset(&sw.sa_mask); sw.sa_flags = 0;
+    sigaction(SIGALRM, &sw, NULL);
+    struct itimerval it;
+    it.it_interval.tv_sec = 1; it.it_interval.tv_usec = 0;
+    it.it_value = it.it_interval;
+    setitimer(ITIMER_REAL, &it, NULL);
     while (!g_stop) {
         /* A short poll timeout so the steady transmit tick runs on our own clock
            even while the device is silent (see tx_send). */
@@ -1306,8 +1363,13 @@ int main(int argc, char **argv) {
         if (pr < 0) { if (errno == EINTR) continue; break; }
         if (pr > 0) {
             ssize_t n = read(fd, buf, sizeof(buf));
-            if (n < 0) { if (errno == EINTR) continue; break; }
-            if (n > 0) {
+            if (n < 0) {
+                /* EAGAIN/EWOULDBLOCK: no data right now, which is normal with a
+                   consuming read. EINTR: a signal (the watchdog timer). Both just
+                   mean "nothing this tick" -- fall through so the transmit tick
+                   and the health check still run. */
+                if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) break;
+            } else if (n > 0) {
                 size_t start = 0;
                 for (ssize_t i = 0; i < n; i++) {
                     if (buf[i] != '\n') continue;
@@ -1315,7 +1377,13 @@ int main(int argc, char **argv) {
                     if (carry + seg < sizeof(line)) {
                         memcpy(line + carry, buf + start, seg);
                         line[carry + seg] = '\0';
-                        feed_line(line);
+                        if (feed_line(line)) {
+                            /* A real device event: everything below keys off it
+                               (transmit hold, stall detector, heartbeat). */
+                            g_lastDataMs = now_ms();
+                            g_evCount++;
+                            g_stallActive = 0;
+                        }
                     }
                     carry = 0; start = (size_t)i + 1;
                 }
@@ -1325,8 +1393,71 @@ int main(int argc, char **argv) {
             }
         }
         long long tnow = now_ms();
+        g_loopTickMs = tnow;                 /* watchdog progress marker */
         if (tnow - g_lastTxMs >= tx_period_ms()) tx_send();
-        if (tnow >= nextHealth) { nextHealth = tnow + SOCK_POLL_MS; health_check(); refresh_target(); }
+
+        if (tnow >= nextHealth) {
+            nextHealth = tnow + SOCK_POLL_MS;
+            health_check();
+            refresh_target();
+            /* Data stall. Armed probes and tracing_on can both look healthy while
+               no events arrive at all: normal before anything requests tracking,
+               but also what a reader-side loss looks like (another trace_pipe
+               consumer draining our events, or a reset buffer). We cannot tell
+               them apart from here, so re-arm -- once per stall, not once a
+               minute forever: idle is the normal state (nothing is tracking
+               whenever no app asks for it), and re_arm() clears every uprobe on
+               the box, so repeating it while idle would hammer tracefs and any
+               other consumer. g_stallActive is cleared by the next real event. */
+            long long idle = tnow - g_lastDataMs;
+            if (g_stateOk && g_evCount > 0 && idle > STALL_MS && !g_stallActive &&
+                tnow - g_lastRearmMs > STALL_REARM_MS) {
+                g_stallActive = 1;
+                g_lastRearmMs = tnow;
+                g_stallCount++;
+                fprintf(stderr, "gxr_alvr: no probe events for %lld ms (ev=%lld tx=%lld, "
+                                "stall #%d); re-arming all probes\n",
+                        idle, g_evCount, g_txCount, g_stallCount);
+                re_arm();
+            }
+        }
+
+        /* Heartbeat, written from the loop itself so it keeps coming even when
+           the device says nothing. This is what separates "no data" from
+           "wedged" and "dead" in the log. ev/tx/idle count only OUR probe events
+           (see feed_line). */
+        if (tnow >= nextHb) {
+            nextHb = tnow + g_hbMs;
+            int probes = 0;
+            if (event_present("pten")) probes++;
+            if (event_present("dir")) probes++;
+            if (event_present("bs")) probes++;
+            if (event_present("jaw")) probes++;
+            if (event_present("tongue")) probes++;
+            fprintf(stderr, "gxr_alvr: hb t=%lld ev=%lld tx=%lld idle=%lldms probes=%d/5 "
+                            "on=%d stalls=%d verbose=%d\n",
+                    tnow, g_evCount, g_txCount, g_lastDataMs ? (tnow - g_lastDataMs) : -1,
+                    probes, tracing_enabled(), g_stallCount, g_verbose);
+            /* Bound the log: a verbose run writes roughly 14 MB an hour, and even
+               the heartbeat alone grows without limit over a long run. Past the
+               cap, verbose goes off and the heartbeat slows down, so the log
+               keeps its liveness proof but stops growing. */
+            struct stat st;
+            if (fstat(2, &st) == 0 && st.st_size > LOG_CAP_BYTES) {
+                if (g_verbose) {
+                    g_verbose = 0;
+                    fprintf(stderr, "gxr_alvr: verbose off (log passed %d KB)\n",
+                            LOG_CAP_BYTES / 1024);
+                }
+                if (g_hbMs != HB_SLOW_MS) {
+                    g_hbMs = HB_SLOW_MS;
+                    nextHb = tnow + g_hbMs;
+                    fprintf(stderr, "gxr_alvr: log passed %d KB; heartbeat now every %d s "
+                                    "(the log starts fresh on the next start)\n",
+                            LOG_CAP_BYTES / 1024, HB_SLOW_MS / 1000);
+                }
+            }
+        }
     }
 
     close(fd);

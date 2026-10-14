@@ -3,6 +3,7 @@
 set_perm $MODPATH/gxr_alvr    0 0 0755
 set_perm $MODPATH/service.sh  0 0 0755
 set_perm $MODPATH/action.sh   0 0 0755
+set_perm $MODPATH/supervise.sh 0 0 0755
 set_perm $MODPATH/webui.sh    0 0 0755
 set_perm $MODPATH/uninstall.sh 0 0 0755
 # Do NOT set permissions on $MODPATH/webroot -- KernelSU sets them itself.
@@ -27,7 +28,11 @@ fi
 # (The new relay starts on reboot -- KernelSU modules are not active until then.)
 KLOG=/data/local/tmp/gxr_alvr_install.log
 {
-  echo "install: killing old gxr_alvr (before: $(pidof gxr_alvr 2>/dev/null)); kept:${KEPT:- none}"
+  echo "install: killing old gxr_alvr + supervisor (before: $(pidof gxr_alvr 2>/dev/null)); kept:${KEPT:- none}"
+  # Supervisor first: killing the relay alone would just make it respawn it.
+  /system/bin/pkill -f "supervise.sh --loop" 2>/dev/null
+  pkill -f "supervise.sh --loop" 2>/dev/null
+  sleep 1
   for p in $(pidof gxr_alvr 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
   /system/bin/pkill -x gxr_alvr 2>/dev/null
   pkill -x gxr_alvr 2>/dev/null

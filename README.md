@@ -1,10 +1,10 @@
 # gxr-root-ft
 
-Galaxy XR → PC **full face/eye tracking** for VRChat. A rooted headset streams its
+Galaxy XR -> PC **full face/eye tracking** for VRChat. A rooted headset streams its
 complete face/eye parameter set to a PC running **VRCFaceTracking**, so your
 avatar's face and eyes follow yours.
 
-This repo is the **headset side** — the sender and the KernelSU module that runs
+This repo is the **headset side** - the sender and the KernelSU module that runs
 it at boot. The PC side is a separate VRCFaceTracking module (installed in step 2
 below).
 
@@ -28,16 +28,16 @@ No ALVR. No adb. No terminal.
 
 Two installs, one per machine. Nothing to configure afterwards.
 
-1. **Headset — install the KernelSU module.** Download `gxr-alvr-vX.Y.Z.zip` from
+1. **Headset - install the KernelSU module.** Download `gxr-alvr-vX.Y.Z.zip` from
    the **Releases** page, install it in the KernelSU Manager, then **reboot**.
    The sender starts by itself at boot. (Installing on its own does not restart
-   the relay — the reboot is what starts it.)
-2. **PC — install the VRCFaceTracking module.** Download `ALVRModule.zip` from the
+   the relay - the reboot is what starts it.)
+2. **PC - install the VRCFaceTracking module.** Download `ALVRModule.zip` from the
    [VRCFT module's latest release](https://github.com/compdoge/VRCFT-ALVR-UE/releases/latest),
    unzip it, and copy **`ALVRModule.dll`** into
    `%APPDATA%\VRCFaceTracking\CustomLibs` (paste that path into the Explorer
    address bar). Restart VRCFaceTracking and check that **ALVR Module** is listed
-   and enabled. It shows up as *ALVR Module* — that is the face-tracking module,
+   and enabled. It shows up as *ALVR Module* - that is the face-tracking module,
    **not** the ALVR streamer.
 3. **Play.** Launch VRChat with face tracking enabled. There is **no PC IP to
    type**: the headset finds the PC by broadcasting.
@@ -49,23 +49,24 @@ Two installs, one per machine. Nothing to configure afterwards.
   Windows Firewall must allow inbound **UDP 41463** for VRCFaceTracking, and the
   headset and PC must be on the same network.
 - **Auto-connect is flaky.** Some access points filter broadcast, and a PC on
-  another subnet will never hear it. Pin the PC's IP to switch to unicast →
+  another subnet will never hear it. Pin the PC's IP to switch to unicast ->
   [Set a custom PC IP](#set-a-custom-pc-ip).
 - **Wi-Fi trackers or a stream (e.g. Steam Link) stutter.** The relay sends 60
-  broadcast datagrams/s, and broadcast is the expensive kind of Wi-Fi traffic.
-  Either lower the datagram rate in the module's **Developer options → `--tx-hz`**,
+  broadcast datagrams/s, continuously (also while nothing is tracking), and
+  broadcast is the expensive kind of Wi-Fi traffic.
+  Either lower the datagram rate in the module's **Developer options -> `--tx-hz`**,
   or pin the PC IP to switch to unicast and keep the full rate.
 
 
 ## Set a custom PC IP
 
-**Auto-connect is the default** — with no config the sender broadcasts to the LAN
+**Auto-connect is the default** - with no config the sender broadcasts to the LAN
 broadcast address, and the PC module (bound `0.0.0.0:41463`) receives that. Set a
 PC explicitly if auto-connect is flaky, if the PC is on another subnet, or to
 switch the stream to unicast.
 
-**Easiest: the module's WebUI.** KernelSU Manager → **Modules** → *Galaxy XR face
-tracking relay* → tap the **Open** button (or tap the card itself). Enter the PC's
+**Easiest: the module's WebUI.** KernelSU Manager -> **Modules** -> *Galaxy XR face
+tracking relay* -> tap the **Open** button (or tap the card itself). Enter the PC's
 IPv4 address and tap **Save & restart relay**. Leave the field empty and Save to
 go back to auto/broadcast. The page also shows live status (target, pid, headset
 IP, log tail), a **Test** button that pings the PC from the headset, and
@@ -104,18 +105,18 @@ use it, stop here.
 ### How it works
 
 The headset runs `gxr_alvr` as **root**. It reads the Galaxy XR perception host
-through **read-only ftrace uprobes** — it only *reads*; it never patches or
+through **read-only ftrace uprobes** - it only *reads*; it never patches or
 injects into vendor code, and it carries numeric signals only (no camera imagery).
 
 Repo layout:
 
-- `headset/` — the C sender `gxr_alvr` (+ build script, wire-format doc, tools).
-- `ksu-module/gxr-alvr/` — the KernelSU module that starts the sender at boot.
+- `headset/` - the C sender `gxr_alvr` (+ build script, wire-format doc, tools).
+- `ksu-module/gxr-alvr/` - the KernelSU module that starts the sender at boot.
 
 ### Wire format
 
 One UDP datagram to port **41463** (`0xA1F7`) = `"UniExpr\0"` + 88 `float32`
-Unified-Expression weights + an 11-float eye tail → **404 bytes**.
+Unified-Expression weights + an 11-float eye tail -> **404 bytes**.
 
 The 88 weights are indexed by VRCFaceTracking's `UnifiedExpressions` (`Max = 88`).
 The eye tail, in order:
@@ -148,7 +149,7 @@ python tools/make_module_zip.py ksu-module/gxr-alvr gxr-alvr.zip   # any OS
 **Entry names must use forward slashes.** KernelSU extracts the zip on Linux, so a
 Windows tool that writes `webroot\index.html` (e.g. `ZipFile.CreateFromDirectory`
 or `Compress-Archive`) creates a *literal file with a backslash* at the module
-root instead of a `webroot/` directory — ksud then reports `web=false` and the
+root instead of a `webroot/` directory - ksud then reports `web=false` and the
 module's WebUI never shows. Use `tools/make_module_zip.py` (writes `/` explicitly)
 or POSIX `zip`.
 

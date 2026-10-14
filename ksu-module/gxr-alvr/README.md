@@ -1,4 +1,4 @@
-# `gxr-alvr` — Galaxy XR face-tracking relay (KernelSU module)
+# `gxr-alvr` - Galaxy XR face-tracking relay (KernelSU module)
 
 Ships the headset-side sender `gxr_alvr` and starts it as root at boot. It reads
 the Galaxy XR perception host through read-only ftrace uprobes and streams the
@@ -11,8 +11,8 @@ module [`compdoge/VRCFT-ALVR-UE`](https://github.com/compdoge/VRCFT-ALVR-UE).
 
 **Install:** the zip goes into the KernelSU Manager, then **reboot** (installing
 alone does not restart the relay). The PC-side module, the full walkthrough and
-the troubleshooting notes — nothing arrives, auto-connect flaky, Wi-Fi
-trackers/streaming stutter — are in the
+the troubleshooting notes - nothing arrives, auto-connect flaky, Wi-Fi
+trackers/streaming stutter - are in the
 [repo README](https://github.com/compdoge/gxr-root-ft#readme).
 
 The rest of this file is reference.
@@ -43,17 +43,16 @@ echo 41463        > /data/adb/modules/gxr-alvr/port   # optional
 
 ## Action button
 
-The Manager **Action** button runs `action.sh`: it stops the current relay
-(including any stale copy from an older module version) and starts it again
-immediately, with no reboot. Use it after changing option files or after a dev
-binary push. **A module update does not restart the relay by itself** — tap
-**Action** (or reboot) after installing a new version. The WebUI's *Save &
-restart* does that for you.
+The Manager **Action** button runs `action.sh`: it stops the **supervisor** and
+the relay, then starts a fresh supervised relay immediately, with no reboot. Use
+it after changing option files or after a dev binary push. **A module update does
+not restart the relay by itself** - tap **Action** (or reboot) after installing a
+new version. The WebUI's *Save & restart* does that for you.
 
 ## Developer options (WebUI)
 
 The WebUI's **Developer options** card exposes the sender's tuning knobs, each
-with a one-line description — the datagram rate (`--tx-hz`), the mirror port,
+with a one-line description - the datagram rate (`--tx-hz`), the mirror port,
 TongueRoll gain, the dilation keys (`--pupil-dilation-gain`, `--pupil-smooth-ms`,
 `--pupil-min-conf`) and the gaze keys. The gaze keys decide when an eye's
 direction is *trustworthy*: a pitch-guarded blink test plus a pupil test relative
@@ -62,26 +61,26 @@ smoothing-only band for a narrowed lid that the pupil test cannot see
 (`--gaze-soft-open`, `--gaze-soft-fmin`), and the base filter speed
 (`--gaze-smooth-fmin`).
 
-A nested **Advanced — firmware probes** section holds the firmware-specific uprobe
+A nested **Advanced - firmware probes** section holds the firmware-specific uprobe
 offsets and plugin paths. They exist so the module can track a firmware change
-without a rebuild, but a wrong value stops face/eye tracking entirely — leave them
+without a rebuild, but a wrong value stops face/eye tracking entirely - leave them
 alone unless you know your firmware differs.
 
 A field left at its default is omitted, so future default changes still reach you;
 **Reset to defaults** clears the file. PC IP, UDP port, TongueRoll and Verbose have
 their own controls in the **Connection** card above.
 
-## Monitor / A–B (optional)
+## Monitor / A-B (optional)
 
 To watch the values on the PC while VRCFT keeps 41463, create a `mirror` file with
-the extra port — the relay then also sends a copy to `<target>:<port>`:
+the extra port - the relay then also sends a copy to `<target>:<port>`:
 
 ```sh
 echo 41464 > /data/adb/modules/gxr-alvr/mirror
 ```
 
-Set `tongue` to `0` to disable the extra `TongueRoll` parameter (A–B test). Both
-are read at start — tap the **Action** button after changing them.
+Set `tongue` to `0` to disable the extra `TongueRoll` parameter (A-B test). Both
+are read at start - tap the **Action** button after changing them.
 
 ## Dev mode (opt-in)
 
@@ -105,19 +104,39 @@ shipped users.)
 | `gxr_alvr` | the sender (built from `headset/gxr_alvr.c`) |
 | `service.sh` | boot / late-load start |
 | `action.sh` | Manager Action button = restart now |
+| `supervise.sh` | reads the option files and runs the relay under a respawn supervisor; called by both of the above |
 | `webui.sh` | helper for the Manager WebUI page (status / set / setdev / test) |
 | `webroot/index.html` | the Manager WebUI page (PC IP, status, log, Developer options) |
 | `customize.sh` | installer permissions + ui_print |
 | `uninstall.sh` | stop the relay on uninstall |
 | `sepolicy.rule` | allow the KernelSU root domain to use tracefs (Enforcing) |
 | `module.prop` | module metadata |
-| `pc`, `port`, `mirror`, `tongue`, `verbose`, `devopts`, `dev` | optional overrides (not shipped — see Option files) |
+| `pc`, `port`, `mirror`, `tongue`, `verbose`, `devopts`, `dev` | optional overrides (not shipped - see Option files) |
 
 ## Logs
 
-`/data/local/tmp/gxr_alvr.log` (append). The relay also logs `armed …` /
-`auto target …` lines at startup. `verbose` gives the tuning trace (~20 Hz gaze,
-4 Hz pupil).
+`/data/local/tmp/gxr_alvr.log` -- a **fresh file on every start** (the previous
+run is kept as `gxr_alvr.log.1`). The relay also logs `armed ...` / `auto target
+...` at startup, and a **heartbeat** every 15 s written from its main loop, so a
+stall is visible even when nothing is arriving:
+
+```
+gxr_alvr: hb t=<ms> ev=<probe events> tx=<datagrams> idle=<ms since last event> probes=<n>/5 on=<1|0> stalls=<n> verbose=<1|0>
+```
+
+`idle` climbing while `ev` stands still means the device is not feeding us;
+`ev` still climbing but `tx` frozen would mean the transmit side is wedged; no
+new heartbeat at all means the process is gone. `ev` counts only this relay's own
+probe events, so other tracefs users cannot make the link look alive.
+
+The relay also self-heals: if no probe events arrive for 3 s (after it has seen
+some at least once) it re-arms all probes and logs it. That happens **once per
+stall**, not repeatedly -- an idle headset produces no events at all whenever
+nothing is asking for tracking, and re-arming clears every uprobe on the device.
+
+`verbose` adds the tuning trace (~20 Hz gaze, 4 Hz pupil). Past 4 MB in a single
+run, verbose switches itself off and the heartbeat slows to every 5 minutes, so a
+long run cannot grow the log without bound.
 
 ## Notes
 
@@ -125,6 +144,11 @@ shipped users.)
   fails soft per probe if the firmware changes.
 - The relay refuses to start a second copy (flock at
   `/data/local/tmp/gxr_alvr.lock`) and self-heals if tracefs is cleared under it.
+- `service.sh`/`action.sh` run the relay under `supervise.sh`, which restarts it
+  if it exits (a crash, or the sender's own watchdog). So `pkill -x gxr_alvr` on
+  its own no longer stops the relay -- it comes straight back. Stop the
+  supervisor first, or just use the Manager's **Action** button. A relay that
+  keeps failing to start is retried with a growing delay (2 s up to 60 s).
 - Wire format is fixed: `"UniExpr\0"` + 88 `float32` UE weights + an 11-float eye
   tail (99 floats, 396 B payload, 404 B datagram). Do not change it without
   updating the PC-side module.
