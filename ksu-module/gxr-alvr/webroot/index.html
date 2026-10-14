@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Galaxy XR ALVR relay</title>
+<title>Galaxy XR face tracking relay</title>
 <style>
   :root { color-scheme: dark; --bg:#121212; --card:#1e1e1e; --fg:#e8e8e8; --dim:#9a9a9a;
           --accent:#7c9cff; --ok:#5ddc8a; --warn:#ffcc66; --err:#ff7b7b; --line:#333; }
@@ -63,7 +63,7 @@
 </style>
 </head>
 <body>
-  <h1>Galaxy XR ALVR relay</h1>
+  <h1>Galaxy XR face tracking relay</h1>
   <div class="sub">Headset-side sender for the VRCFT-ALVR-UE module &middot; UDP 41463</div>
 
   <div class="card">
@@ -276,6 +276,7 @@ var DEVOPTS = [
   { f:"--pupil-dilation-gain", d:"0.75", k:"num", t:"Widens the dilation window by 1/gain. Raise toward 1.0 for a wider, more sensitive dilation range." },
   { f:"--pupil-smooth-ms", d:"350", k:"num", t:"Per-eye low-pass time constant. Higher = steadier but slower to follow." },
   { f:"--pupil-min-conf", d:"0.25", k:"num", t:"Ignore pupil detections whose confidence is below this." },
+  { f:"--tx-hz", d:"60", k:"num", t:"Datagrams per second. Lower it if this stream disturbs Wi-Fi trackers or streaming on your LAN (broadcast is the expensive kind of traffic). A pinned PC IP does not need this." },
   { f:"--gaze-lid-low", d:"0.70", k:"num", t:"An eyelid below this openness counts as narrowed; the gaze is then only trusted while the pupil still looks normal. This is what stops squints shaking the gaze without freezing it when you look down." },
   { f:"--gaze-pupil-ratio", d:"0.55", k:"num", t:"A pupil below this fraction of the eye's own recent size counts as covered by the lid. Lower = trusts the gaze more; higher = freezes it sooner." },
   { f:"--gaze-soft-open", d:"0.75", k:"num", t:"Below this openness the lid is narrowed and the gaze is smoothed much harder (not frozen). Must sit just below your resting openness: raise it if squints still shake, lower it if normal blinking feels laggy." },

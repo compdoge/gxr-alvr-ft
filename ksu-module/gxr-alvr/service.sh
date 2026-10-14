@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# KernelSU module service script: start the Galaxy XR ALVR relay as root.
+# KernelSU module service script: start the Galaxy XR face-tracking relay as root.
 # Runs in late_start service (and in late-load mode). MODDIR = the module dir.
 MODDIR=${0%/*}
 

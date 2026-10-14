@@ -35,7 +35,7 @@ KLOG=/data/local/tmp/gxr_alvr_install.log
   sleep 1
   echo "install: after kill (pidof: $(pidof gxr_alvr 2>/dev/null))"
 } >> "$KLOG" 2>&1
-ui_print "- gxr-alvr: Galaxy XR ALVR relay installed"
+ui_print "- gxr-alvr: Galaxy XR face tracking relay installed"
 ui_print "  reboot to activate this version (KernelSU modules load at boot)"
 ui_print "  target: auto (LAN broadcast) -> VRCFT-ALVR module on UDP 41463"
 ui_print "  set the PC's IP from the Manager: tap WebUI on this module"

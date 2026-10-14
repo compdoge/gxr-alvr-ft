@@ -59,7 +59,7 @@
 
 /* Reported in the startup log and by --version, so the running build is always
    identifiable (avoids "is the new binary actually live?" confusion). */
-#define GXR_VERSION "1.3.5"
+#define GXR_VERSION "1.3.6"
 
 #define TRACE "/sys/kernel/tracing"
 #define EYE_PLUGIN "/vendor/lib64/libperception_eye_tracking_host_plugin.so"
@@ -542,9 +542,9 @@ static void target_list(char *s, size_t n) {
 }
 
 /* Resolve the auto target(s): the directed broadcast of every up,
-   broadcast-capable IPv4 interface (wlan* first so it leads the list), then the
-   limited broadcast 255.255.255.255. Fanning out covers multi-interface hosts
-   and routers that filter one form of broadcast. Returns the count resolved. */
+   broadcast-capable IPv4 interface (wlan* first so it leads the list). The
+   limited broadcast 255.255.255.255 is only a fallback -- see below.
+   Returns the count resolved. */
 static int resolve_targets(void) {
     struct ifaddrs *ifs = NULL;
     if (getifaddrs(&ifs) != 0) return 0;
@@ -560,7 +560,13 @@ static int resolve_targets(void) {
         }
     }
     freeifaddrs(ifs);
-    if (g_ntargets > 0) {
+    /* 255.255.255.255 is now only a fallback. Broadcast frames are sent at the
+       basic rate, so each one costs far more airtime than a unicast frame, and
+       sending to both forms of broadcast doubled that cost for no benefit on the
+       usual single-subnet LAN -- a 60 Hz stream to two broadcast addresses was
+       enough to disturb Wi-Fi trackers and latency-sensitive streaming sharing
+       the same air. The directed broadcast above covers the LAN in practice. */
+    if (g_ntargets == 0) {
         struct in_addr all; all.s_addr = htonl(INADDR_BROADCAST);   /* 255.255.255.255 */
         add_target(&all);
     }
@@ -662,9 +668,20 @@ static long long g_jawNeutralMs;
    the module vanish -- the "face tracking stops after every test" report. We now
    transmit on our own clock: replay the last computed frame, and relax the face
    to neutral if the device stays quiet for a while. */
-#define TX_HZ 60                        /* steady datagram rate */
-#define TX_PERIOD_MS (1000 / TX_HZ)
+static int g_txHz = 60;                 /* steady datagram rate, datagrams/s */
 #define TX_HOLD_MS 2000                 /* replay the last frame this long, then relax */
+
+/* The datagram rate is a runtime knob (--tx-hz) because broadcast traffic is
+   sent at the Wi-Fi basic rate and so costs far more airtime per frame than
+   unicast: on a shared LAN a 60 Hz broadcast stream can disturb Wi-Fi trackers
+   and latency-sensitive streaming. Lower it if you see that; a pinned PC IP is
+   unicast and needs no trade-off. */
+static int tx_period_ms(void) {
+    int h = g_txHz;
+    if (h < 5) h = 5;
+    if (h > 240) h = 240;
+    return 1000 / h;
+}
 static float g_ue[UE_MAX], g_tail[TAIL_N];   /* last computed frame */
 static int g_stateOk;                        /* a frame has been computed */
 static long long g_lastTxMs, g_lastDataMs;   /* last datagram sent / last device upline */
@@ -923,7 +940,7 @@ static void compute_and_send(void) {
            filter is FILTER_TYPE_NONE and it has no lid gate), so a partly closed
            eyelid's corrupted direction used to go straight out. */
         float dt = (float)(now - g_gazeMs); g_gazeMs = now;
-        if (dt <= 0.0f || dt > 500.0f) dt = (float)TX_PERIOD_MS;
+        if (dt <= 0.0f || dt > 500.0f) dt = (float)tx_period_ms();
         float ad = 1.0f / (1.0f + (1.0f / (TWO_PI_F * fmaxf(GAZE_DCUT, 0.01f))) / dt);
         /* Per-eye pupil size for the occlusion test, straight from the raw
            detections -- NOT the conf-filtered dilation path, because the fit
@@ -1100,6 +1117,9 @@ static void usage(FILE *f, const char *argv0) {
         "Usage: %s [--pc <ip>] [--port <n>] [options]\n"
         "  --pc <ip[,ip..]>     fixed unicast target(s) (default: auto broadcast)\n"
         "  --port <n>           UDP target port (default 41463)\n"
+        "  --tx-hz <n>          datagrams per second (default 60, clamped 5-240).\n"
+        "                       Lower it if broadcast traffic disturbs Wi-Fi trackers\n"
+        "                       or streaming on your LAN. A pinned PC IP does not need it.\n"
         "  --verbose            fast gaze trace + pupil dump for tuning\n"
         "  --gaze-swap 0|1      swap gaze axes (default 0)\n"
         "  --gaze-invert-x 0|1  invert Gaze.x (default 0)\n"
@@ -1169,6 +1189,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--gaze-smooth-fmin") && i + 1 < argc) GAZE_FMIN = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--gaze-smooth-beta") && i + 1 < argc) GAZE_BETA = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--gaze-smooth-dcut") && i + 1 < argc) GAZE_DCUT = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--tx-hz") && i + 1 < argc) g_txHz = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pupil-offset") && i + 1 < argc) pupil_off = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--eye-dir-offset") && i + 1 < argc) eyedir_off = strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--face-bs-offset") && i + 1 < argc) face_off = strtoul(argv[++i], NULL, 0);
@@ -1281,7 +1302,7 @@ int main(int argc, char **argv) {
     while (!g_stop) {
         /* A short poll timeout so the steady transmit tick runs on our own clock
            even while the device is silent (see tx_send). */
-        int pr = poll(&pfd, 1, TX_PERIOD_MS);
+        int pr = poll(&pfd, 1, tx_period_ms());
         if (pr < 0) { if (errno == EINTR) continue; break; }
         if (pr > 0) {
             ssize_t n = read(fd, buf, sizeof(buf));
@@ -1304,7 +1325,7 @@ int main(int argc, char **argv) {
             }
         }
         long long tnow = now_ms();
-        if (tnow - g_lastTxMs >= TX_PERIOD_MS) tx_send();
+        if (tnow - g_lastTxMs >= tx_period_ms()) tx_send();
         if (tnow >= nextHealth) { nextHealth = tnow + SOCK_POLL_MS; health_check(); refresh_target(); }
     }
 
