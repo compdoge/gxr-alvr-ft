@@ -51,11 +51,35 @@ Two installs, one per machine. Nothing to configure afterwards.
 - **Auto-connect is flaky.** Some access points filter broadcast, and a PC on
   another subnet will never hear it. Pin the PC's IP to switch to unicast ->
   [Set a custom PC IP](#set-a-custom-pc-ip).
-- **Wi-Fi trackers or a stream (e.g. Steam Link) stutter.** The relay sends 60
-  broadcast datagrams/s, continuously (also while nothing is tracking), and
-  broadcast is the expensive kind of Wi-Fi traffic.
-  Either lower the datagram rate in the module's **Developer options -> `--tx-hz`**,
-  or pin the PC IP to switch to unicast and keep the full rate.
+- **Wi-Fi trackers or a stream (e.g. Steam Link) stutter.** While it is feeding
+  you, the relay sends up to 60 datagrams/s, and to the LAN broadcast address if
+  you have not pinned the PC - broadcast is the expensive kind of Wi-Fi traffic.
+  Idle it drops to a 10 Hz keepalive, and a pinned PC IP makes the stream unicast.
+  If it still stutters, lower the rate in the module's **Developer options ->
+  `--tx-hz`**.
+
+
+## Does it make the headset hotter?
+
+Short answer: it is a small, honest addition, and you can measure it on your own
+device.
+
+The module only *reads*. It attaches 5 read-only uprobes to functions the headset
+already calls for its own face/eye tracking, and parses the events they emit. In a
+real session that is about **330 probe hits a second** in total (roughly 4.6 per
+frame at 72 Hz), plus 50-60 small UDP datagrams/s. When nothing is tracking it
+idles: a 10 Hz loop and a 10 Hz keepalive. Its trace ring buffer is 6 MB (before
+v1.3.8 it was about 96 MB of unreclaimable kernel memory, held for the whole
+session).
+
+The Galaxy XR is thermally marginal, and VR streaming already runs it at its
+limit - so any extra work can be the straw rather than the bale, and a difference
+of a few percent is easy to feel and hard to attribute. If you want to know what
+this module costs on *your* headset, use the WebUI: run the same game, in the same
+place, with the same stream settings, once with **Pause** and once running, and
+compare the headset's temperature and FPS. Pause really does stop it - the relay
+disables its probes on the way out - so it is a fair comparison, and it needs no
+reboot.
 
 
 ## Set a custom PC IP
@@ -69,8 +93,10 @@ switch the stream to unicast.
 tracking relay* -> tap the **Open** button (or tap the card itself). Enter the PC's
 IPv4 address and tap **Save & restart relay**. Leave the field empty and Save to
 go back to auto/broadcast. The page also shows live status (target, pid, headset
-IP, log tail), a **Test** button that pings the PC from the headset, and
-**Refresh** to re-read status.
+IP, log tail), a **Test** button that pings the PC from the headset, **Refresh**,
+a **Pause** / **Resume** pair that stops and starts face tracking without a
+reboot (handy for the comparison below), and **Export logs**, which copies the
+current log, the previous run and the install log to `/sdcard/Download`.
 
 **Or by hand (root):**
 
@@ -81,8 +107,9 @@ echo 41463        > /data/adb/modules/gxr-alvr/port    # optional
 ```
 
 Delete `pc` to return to auto/broadcast. `port` defaults to `41463`. These option
-files (`pc`, `port`, `mirror`, `tongue`, `verbose`, `dev`) are **preserved across
-module updates**.
+files (`pc`, `port`, `mirror`, `tongue`, `verbose`, `devopts`, `dev`) are
+**preserved across module updates**; the WebUI's `paused` marker is not, so a
+reboot always starts the relay.
 
 
 ## Benefits
@@ -163,6 +190,11 @@ change `headset/gxr_alvr.c`, rebuild and re-copy it.
   changes.
 - The sender refuses to start a second copy (`flock`) and self-heals if tracefs is
   cleared under it.
+- If something **outside** the module kills the relay (`rc=137`, usually the
+  low-memory killer), the supervisor does not restart it: it logs why and stops,
+  and you start it again from the Manager **Action** button or the WebUI. Putting
+  back the probes and the ring buffer after the system decided to shed this
+  process would only re-add the load it was shedding.
 - Eyes can be slightly jittery on the current host DNN output.
 
 

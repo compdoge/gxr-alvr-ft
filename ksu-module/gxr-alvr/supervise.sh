@@ -9,6 +9,10 @@
 #     reboot or a manual Action tap.
 # Because of it, a deliberate stop must kill the SUPERVISOR first: killing the
 # relay alone would just make the supervisor start it again.
+#
+# Two exits are terminal and are NOT restarted: rc=5 (another live relay holds
+# the lock) and rc=137 (something outside this module killed the relay). See the
+# respawn loop below for why.
 MODDIR=${0%/*}
 [ -f "$MODDIR/module.prop" ] || MODDIR=/data/adb/modules/gxr-alvr
 LOG=/data/local/tmp/gxr_alvr.log
@@ -26,6 +30,18 @@ if [ "$1" = "--loop" ]; then
       # Another live relay holds the single-instance lock. Retrying cannot fix
       # that, it would only fight the instance that is already running.
       echo "gxr-alvr: relay exited rc=5 (another relay holds the lock); supervisor stopping" >>"$LOG"
+      exit 0
+    fi
+    if [ "$rc" = "137" ]; then
+      # 128+9: something OUTSIDE this module sent SIGKILL (on Android that is
+      # usually lmkd under memory pressure, or a vendor/thermal policy killing
+      # background work). That is a decision about this process, not a crash, so
+      # do not overrule it: restarting means rebuilding every uprobe and asking
+      # the kernel for the whole ring buffer again, which is exactly the load the
+      # killer was trying to shed, and if it keeps happening the two of us fight.
+      # The relay is not running now; start it again from the Manager (Action
+      # button) or the WebUI when it suits you.
+      echo "gxr-alvr: relay was killed from outside (rc=137 SIGKILL); not restarting. Tap Action or use the WebUI Pause/Resume to start it again" >>"$LOG"
       exit 0
     fi
     # Back off on repeated failure: without this, a relay that can never start

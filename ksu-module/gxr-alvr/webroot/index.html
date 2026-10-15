@@ -67,12 +67,22 @@
   <div class="sub">Headset-side sender for the VRCFT-ALVR-UE module &middot; UDP 41463</div>
 
   <div class="card">
-    <h2>Status <span id="bridge" class="pill">connecting...</span></h2>
+    <h2>Status <span id="bridge" class="pill">connecting...</span><span id="state" class="pill">-</span></h2>
     <dl>
       <dt>Target</dt><dd id="s-armed" class="mono">-</dd>
       <dt>Relay pid</dt><dd id="s-pid" class="mono">-</dd>
       <dt>Headset IP</dt><dd id="s-ip" class="mono">-</dd>
     </dl>
+    <div class="btns">
+      <button id="btn-pause" title="Stop the relay and disable its probes, without a reboot">Pause</button>
+      <button id="btn-resume" title="Start the relay again">Resume</button>
+      <button id="btn-export" title="Copy the logs to /sdcard/Download">Export logs</button>
+    </div>
+    <div class="hint">Pause stops the relay and disables its probes, as if face tracking
+      were uninstalled but without a reboot - useful to compare a session with tracking on
+      and off. Resume starts it again. Export copies the logs (and the previous run) to
+      <span class="mono">/sdcard/Download</span>.</div>
+    <div id="pause-result" class="hint"></div>
   </div>
 
   <div class="card">
@@ -174,7 +184,21 @@ function parseKV(out) {
 
 function setBusy(b) {
   BUSY = b;
-  ["btn-save", "btn-refresh", "btn-test", "btn-dev-save", "btn-dev-reset"].forEach(function (id) { $(id).disabled = b; });
+  ["btn-save", "btn-refresh", "btn-test", "btn-dev-save", "btn-dev-reset",
+   "btn-pause", "btn-resume", "btn-export"].forEach(function (id) { $(id).disabled = b; });
+}
+
+/* Pause/resume only make sense one way round: Pause needs a running relay,
+   Resume needs one that is stopped or paused. Called after setBusy(false). */
+function applyRelayState(s) {
+  var paused = (s.paused === "1");
+  var running = !!s.pid;
+  var el = $("state");
+  if (paused) { el.textContent = "paused"; el.className = "pill warn"; }
+  else if (running) { el.textContent = "running"; el.className = "pill ok"; }
+  else { el.textContent = "not running"; el.className = "pill err"; }
+  $("btn-pause").disabled = paused || !running;
+  $("btn-resume").disabled = running && !paused;
 }
 
 function refresh() {
@@ -201,6 +225,7 @@ function refresh() {
     $("s-ip").textContent = (s.ip || "").replace(/,+$/, "") || "-";
     $("s-log").textContent = (s.tail || "-").split("~").join("\n");
     setBusy(false);
+    applyRelayState(s);
   });
 }
 
@@ -402,6 +427,56 @@ function saveDev() {
   });
 }
 
+/* ---- Pause / Resume / Export. Pause is the honest A/B switch for "is this
+   module costing me heat": it stops the relay and disables its probes with no
+   reboot and no zip swap. ---- */
+function relayAction(verb, busyText, okText) {
+  if (BUSY) return;
+  setBusy(true);
+  $("pause-result").textContent = busyText;
+  $("pause-result").className = "hint";
+  ksuExec("sh " + MOD + "/webui.sh " + verb).then(function (r) {
+    var s = parseKV(r.stdout);
+    if (r.errno === 0 && s.ok === "1") {
+      $("pause-result").textContent = okText + (s.pid ? " (pid " + s.pid + ")." : "");
+      $("pause-result").className = "hint ok";
+      if (typeof ksu !== "undefined" && ksu.toast) ksu.toast(okText);
+    } else {
+      $("pause-result").textContent = "Failed: " + (s.error || r.stderr || ("exit " + r.errno));
+      $("pause-result").className = "hint err";
+    }
+    refresh();
+  });
+}
+
+function pauseRelay() {
+  relayAction("pause", "Stopping the relay and disabling its probes...",
+              "Paused: the relay is stopped and its probes are disabled, so face tracking is off");
+}
+
+function resumeRelay() {
+  relayAction("resume", "Starting the relay...", "Resumed: the relay is running");
+}
+
+function exportLogs() {
+  if (BUSY) return;
+  setBusy(true);
+  $("pause-result").textContent = "Copying logs to Downloads...";
+  $("pause-result").className = "hint";
+  ksuExec("sh " + MOD + "/webui.sh exportlog").then(function (r) {
+    var s = parseKV(r.stdout);
+    if (r.errno === 0 && Number(s.ok) > 0) {
+      $("pause-result").textContent = "Copied " + s.ok + " file(s) to " + (s.dir || "/sdcard/Download") +
+        " (gxr-alvr-log.txt and gxr-alvr-log-previous.txt).";
+      $("pause-result").className = "hint ok";
+    } else {
+      $("pause-result").textContent = "Failed: " + (s.error || r.stderr || ("exit " + r.errno));
+      $("pause-result").className = "hint err";
+    }
+    refresh();
+  });
+}
+
 document.addEventListener("DOMContentLoaded", function () {
   renderDev();
   $("btn-save").addEventListener("click", save);
@@ -409,6 +484,9 @@ document.addEventListener("DOMContentLoaded", function () {
   $("btn-test").addEventListener("click", test);
   $("btn-dev-save").addEventListener("click", saveDev);
   $("btn-dev-reset").addEventListener("click", resetDev);
+  $("btn-pause").addEventListener("click", pauseRelay);
+  $("btn-resume").addEventListener("click", resumeRelay);
+  $("btn-export").addEventListener("click", exportLogs);
   refresh();
 });
 </script>

@@ -33,6 +33,7 @@ Every setting is an optional file in the module directory. All of them are
 | `verbose` | enables the fast tuning log (see Logs). |
 | `devopts` | the WebUI's Developer-options flags, one `--flag value` per line. A **pure data file**: values are restricted to `A-Za-z0-9 . _ , : / + - =`, so nothing can escape into the shell. |
 | `dev` | opt-in dev override: prefer a binary at `/data/local/tmp/gxr_alvr` (see Dev mode). |
+| `paused` | marker: written by the WebUI **Pause** button, cleared by **Resume**. A reboot starts the relay regardless. |
 
 By hand (root):
 
@@ -70,6 +71,23 @@ A field left at its default is omitted, so future default changes still reach yo
 **Reset to defaults** clears the file. PC IP, UDP port, TongueRoll and Verbose have
 their own controls in the **Connection** card above.
 
+## Pause / Resume / Export logs (WebUI)
+
+The status card has three buttons:
+
+- **Pause** stops the supervisor and the relay, and the relay disables its probes
+  on the way out, so a paused module is genuinely not tracing anything. No reboot
+  and no module swap - which makes it the honest way to answer "is this module
+  costing me frames or heat": run the same session paused and running, watching
+  the headset's own thermals and FPS.
+- **Resume** starts it again.
+- **Export logs** copies the current log, the previous run and the install log to
+  `/sdcard/Download` (`gxr-alvr-log.txt`, `gxr-alvr-log-previous.txt`,
+  `gxr-alvr-install-log.txt`), overwriting the older copies rather than piling up
+  files.
+
+A pause lasts until **Resume** or a reboot (a reboot always starts the relay).
+
 ## Monitor / A-B (optional)
 
 To watch the values on the PC while VRCFT keeps 41463, create a `mirror` file with
@@ -105,8 +123,8 @@ shipped users.)
 | `service.sh` | boot / late-load start |
 | `action.sh` | Manager Action button = restart now |
 | `supervise.sh` | reads the option files and runs the relay under a respawn supervisor; called by both of the above |
-| `webui.sh` | helper for the Manager WebUI page (status / set / setdev / test) |
-| `webroot/index.html` | the Manager WebUI page (PC IP, status, log, Developer options) |
+| `webui.sh` | helper for the Manager WebUI page (status / set / setdev / pause / resume / exportlog / test) |
+| `webroot/index.html` | the Manager WebUI page (PC IP, status, Pause/Resume, log export, log tail, Developer options) |
 | `customize.sh` | installer permissions + ui_print |
 | `uninstall.sh` | stop the relay on uninstall |
 | `sepolicy.rule` | allow the KernelSU root domain to use tracefs (Enforcing) |
@@ -121,7 +139,7 @@ run is kept as `gxr_alvr.log.1`). The relay also logs `armed ...` / `auto target
 stall is visible even when nothing is arriving:
 
 ```
-gxr_alvr: hb t=<ms> ev=<probe events> tx=<datagrams> idle=<ms since last event> probes=<n>/5 on=<1|0> stalls=<n> verbose=<1|0>
+gxr_alvr: hb t=<ms> ev=<probe events> tx=<datagrams> idle=<ms since last event> probes=<n>/5 on=<1|0> quiet=<n> verbose=<1|0>
 ```
 
 `idle` climbing while `ev` stands still means the device is not feeding us;
@@ -129,14 +147,37 @@ gxr_alvr: hb t=<ms> ev=<probe events> tx=<datagrams> idle=<ms since last event> 
 new heartbeat at all means the process is gone. `ev` counts only this relay's own
 probe events, so other tracefs users cannot make the link look alive.
 
-The relay also self-heals: if no probe events arrive for 3 s (after it has seen
-some at least once) it re-arms all probes and logs it. That happens **once per
-stall**, not repeatedly -- an idle headset produces no events at all whenever
-nothing is asking for tracking, and re-arming clears every uprobe on the device.
+A quiet device is the **normal** state: with no app asking for tracking, nothing
+calls the probed functions. Silence therefore proves nothing by itself, so when no
+event has arrived for 3 s the relay logs one
+`no probe events for ... quiet episode #n` line per episode and names the tracefs
+verdict - **healthy, so this is idle rather than a fault**, or **was unhealthy and
+has been re-armed**. The re-arm only happens when the 3 s health check finds that
+our probe set or `tracing_on` really was changed under us. It is deliberately not
+triggered by idleness: re-arming clears every uprobe on the device, and it could
+not fix the one case it cannot see (a foreign `trace_pipe` consumer) anyway.
 
 `verbose` adds the tuning trace (~20 Hz gaze, 4 Hz pupil). Past 4 MB in a single
 run, verbose switches itself off and the heartbeat slows to every 5 minutes, so a
 long run cannot grow the log without bound.
+
+## Load (what it costs the headset)
+
+The module is read-only: it hooks 5 existing vendor functions with uprobes and
+parses the events they emit. In a real session (Virtual Desktop + VRChat) those 5
+probes together fire about **330 times a second** - roughly 4.6 per frame at
+72 Hz - and the relay parses them and sends ~50-60 datagrams/s. That is the whole
+cost, and it does not depend on how many PC-side modules read the stream.
+
+Idle is deliberately much cheaper than active: once no probe event has arrived for
+1 s the relay drops to a 10 Hz loop and a 10 Hz keepalive (still sending a relaxed
+neutral frame, so the PC side sees no difference) and returns to the full rate the
+moment real events arrive. Before v1.3.8 it polled and transmitted at the full
+rate around the clock, tracking or not.
+
+The trace ring buffer is **1024 KB per CPU** (6 MB on this 6-core SoC). It used to
+be 16384 KB per CPU - about 96 MB of unreclaimable kernel memory held for the whole
+session - which was sized for an old blocking-read stall that no longer exists.
 
 ## Notes
 
@@ -149,6 +190,13 @@ long run cannot grow the log without bound.
   its own no longer stops the relay -- it comes straight back. Stop the
   supervisor first, or just use the Manager's **Action** button. A relay that
   keeps failing to start is retried with a growing delay (2 s up to 60 s).
+- Two exits are **not** retried. `rc=5` (another live relay holds the lock) and
+  `rc=137` (SIGKILL from outside the module - usually the low-memory killer, or a
+  vendor/thermal policy shedding background work). The second one matters: that
+  kill is the system's decision about this process, and restarting means
+  rebuilding every uprobe and asking for the ring buffer again, i.e. putting back
+  the load it was shedding. The supervisor logs it and stops instead; start the
+  relay again from the Manager **Action** button or the WebUI **Resume**.
 - Wire format is fixed: `"UniExpr\0"` + 88 `float32` UE weights + an 11-float eye
   tail (99 floats, 396 B payload, 404 B datagram). Do not change it without
   updating the PC-side module.

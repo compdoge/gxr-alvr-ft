@@ -61,9 +61,17 @@
 
 /* Reported in the startup log and by --version, so the running build is always
    identifiable (avoids "is the new binary actually live?" confusion). */
-#define GXR_VERSION "1.3.7"
+#define GXR_VERSION "1.3.8"
 
 #define TRACE "/sys/kernel/tracing"
+/* Per-CPU trace ring buffer. The probes fire about 330 times a second, which is
+   roughly 50 KB/s of trace text in total, so 1024 KB per CPU is on the order of
+   two minutes of backlog on each of the 6 cores -- and the loop drains every
+   16 ms, so it never comes close to that. This used to be 16384 KB, which is
+   16x more: close to 96 MB of UNRECLAIMABLE kernel memory held for the whole
+   session on a 16 GB device. That size existed to survive the old blocking
+   trace_pipe read (a parked reader let the buffer fill), and that read is gone. */
+#define RING_KB 1024
 #define EYE_PLUGIN "/vendor/lib64/libperception_eye_tracking_host_plugin.so"
 #define FACE_PLUGIN "/vendor/lib64/libperception_face_parameter_tracking_host_plugin.so"
 #define DEFAULT_PUPIL_OFFSET   0x4bef60UL
@@ -261,6 +269,12 @@ static int write_file(const char *path, const char *data) {
     close(fd);
     return (w == (ssize_t)n) ? 0 : -1;
 }
+/* Single place that sizes our ring buffers (see RING_KB). */
+static void set_ring_kb(void) {
+    char b[16];
+    snprintf(b, sizeof(b), "%d\n", RING_KB);
+    write_file(TRACE "/buffer_size_kb", b);
+}
 static void tracefs_cleanup(void) {
     /* O_TRUNC clear + disable: a bare "\n" write does not clear here. */
     write_file(TRACE "/tracing_on", "0\n");
@@ -418,14 +432,14 @@ static int event_present(const char *name) {
 }
 static void re_arm(void) {
     tracefs_cleanup();
-    write_file(TRACE "/buffer_size_kb", "16384\n");
+    set_ring_kb();
     arm_pupil(g_eye_plugin, g_pupil_off);
     arm_eyedir(g_eye_plugin, g_eyedir_off);
     arm_face(g_face_plugin, g_face_off);
     arm_jaw(g_face_plugin, g_jaw_off);
     arm_tongue(g_face_plugin, g_tongue_off);
     write_file(TRACE "/tracing_on", "1\n");
-    fprintf(stderr, "gxr_alvr: re-armed (tracefs had been changed under us)\n");
+    fprintf(stderr, "gxr_alvr: re-armed (our probe set had been changed under us)\n");
 }
 static int tracing_enabled(void) {
     char c = 0;
@@ -433,18 +447,24 @@ static int tracing_enabled(void) {
     if (f >= 0) { if (read(f, &c, 1) < 0) c = 0; close(f); }
     return c == '1';
 }
-static void health_check(void) {
+static int health_check(void) {
     /* If any of our events vanished (something truncated uprobe_events),
        re-create the whole set. Otherwise, if only tracing_on was toggled,
        just turn it back on -- this avoids destroying a capture tool's own
-       probes when ours are still intact. */
+       probes when ours are still intact.
+       Returns 1 if it had to fix something, 0 if tracefs already matched what we
+       armed. The quiet-episode report in the loop keys off this: see there. */
     if (!event_present("pten") || !event_present("dir") ||
         !event_present("bs") || !event_present("jaw") || !event_present("tongue")) {
         re_arm();
-    } else if (!tracing_enabled()) {
+        return 1;
+    }
+    if (!tracing_enabled()) {
         write_file(TRACE "/tracing_on", "1\n");
         fprintf(stderr, "gxr_alvr: tracing_on had been cleared; re-enabled\n");
+        return 1;
     }
+    return 0;
 }
 
 /* ---------------- parsing ---------------- */
@@ -692,20 +712,40 @@ static int tx_period_ms(void) {
    the main loop itself, so it keeps appearing even when nothing probes. */
 #define HB_MS 15000                     /* heartbeat cadence (always on) */
 #define HB_SLOW_MS 300000               /* ...and once the log has passed the cap */
-#define STALL_MS 3000                   /* no probe event for this long = stalled */
-#define STALL_REARM_MS 60000            /* re-arm at most this often while stalled */
+#define QUIET_MS 3000                   /* no OUR-probe event for this long = quiet */
 #define WATCHDOG_MS 5000                /* no main-loop progress this long -> exit */
 #define LOG_CAP_BYTES (4 * 1024 * 1024) /* verbose switches itself off past this */
+/* Idle dormancy. When nothing feeds the probes (no app is asking for tracking)
+   there is nothing to parse and nothing new to send, so the loop only has to
+   stay alive enough to notice the first event and to keep the PC link warm. A
+   headset can sit like that for hours, so this is the load that matters for
+   thermals and battery: it used to poll and transmit at the full rate around
+   the clock, tracking or not. Both values are deliberately conservative -- 100 ms
+   keeps the added latency when tracking resumes invisible, and 10 Hz keeps the
+   link (and the PC side's own timeout) happy. */
+#define IDLE_MS 1000                    /* no event for this long => dormant */
+#define IDLE_POLL_MS 100                /* dormant loop period (10 wakeups/s) */
+#define IDLE_TX_HZ 10                   /* dormant keepalive datagrams/s */
 static long long g_loopTickMs;          /* last main-loop progress (watchdog) */
-static long long g_lastRearmMs;         /* last stall-triggered re-arm */
+static volatile sig_atomic_t g_maint;   /* a tracefs maintenance op is running */
 static long long g_evCount;             /* OUR probe events parsed */
 static long long g_txCount;             /* datagrams sent */
-static int g_stallCount;                /* stall-triggered re-arms so far */
-static int g_stallActive;               /* already re-armed for this stall episode */
+static int g_quietCount;                /* quiet episodes logged so far */
+static int g_quietActive;               /* already logged this quiet episode */
 static int g_hbMs = HB_MS;              /* heartbeat interval, slowed past the cap */
 static float g_ue[UE_MAX], g_tail[TAIL_N];   /* last computed frame */
 static int g_stateOk;                        /* a frame has been computed */
 static long long g_lastTxMs, g_lastDataMs;   /* last datagram sent / last device upline */
+
+/* Dormant: no probe event recently, so there is nothing to parse and nothing to
+   say past a keepalive. Dormant from the start too (g_lastDataMs is 0 until the
+   first event), which is the normal state for a headset nobody is wearing.
+   The dormant period is never faster than the user's own --tx-hz, so a slow
+   stream (--tx-hz 5) stays slow while idle instead of speeding up to 10 Hz. */
+static int at_least(int a, int b) { return a > b ? a : b; }
+static int idle_now(void) { return g_lastDataMs == 0 || (now_ms() - g_lastDataMs) > IDLE_MS; }
+static int poll_ms(void) { return idle_now() ? at_least(IDLE_POLL_MS, tx_period_ms()) : tx_period_ms(); }
+static int tx_gap_ms(void) { return idle_now() ? at_least(1000 / IDLE_TX_HZ, tx_period_ms()) : tx_period_ms(); }
 
 static void tx_send(void) {
     long long now = now_ms();
@@ -1098,7 +1138,7 @@ static void compute_and_send(void) {
 /* Returns 1 if the line was one of OUR probe events, 0 otherwise. trace_pipe is
    the GLOBAL pipe: when anything else has tracefs events enabled (a capture
    script, a vendor tracer) its lines land here too. Counting and timestamping
-   only our own events keeps the heartbeat, the stall detector and the transmit
+   only our own events keeps the heartbeat, the quiet detector and the transmit
    hold honest -- a foreign event must not look like the device feeding us. */
 static int feed_line(const char *line) {
     int idx; float v[6];
@@ -1183,9 +1223,14 @@ static void usage(FILE *f, const char *argv0) {
    loop has not progressed for WATCHDOG_MS, log it and exit. Exiting is the right
    recovery because the module runs the relay under a supervisor that starts it
    again -- a frozen relay helps nobody and the PC only sees a short gap.
+   Deliberate maintenance is exempt (g_maint): arming or clearing uprobes makes
+   the kernel synchronise RCU and can sit on a tracefs write for a while, and
+   killing the relay because it was legitimately maintaining tracefs is how a
+   kill/restart loop starts.
    Async-signal-safe only: clock_gettime, write, _exit. */
 static void on_alarm(int s) {
     (void)s;
+    if (g_maint) return;                              /* maintenance, not a stall */
     if (now_ms() - g_loopTickMs > WATCHDOG_MS) {
         static const char msg[] = "gxr_alvr: watchdog: main loop stalled; exiting so the supervisor can restart\n";
         ssize_t w = write(2, msg, sizeof(msg) - 1);
@@ -1319,7 +1364,7 @@ int main(int argc, char **argv) {
     if (acquire_lock() < 0) return 5;
 
     tracefs_cleanup();
-    write_file(TRACE "/buffer_size_kb", "16384\n");
+    set_ring_kb();
     g_pupil_off = pupil_off; g_eyedir_off = eyedir_off;
     g_face_off = face_off; g_jaw_off = jaw_off; g_tongue_off = tongue_off;
     g_eye_plugin = eye_plugin; g_face_plugin = face_plugin;
@@ -1357,9 +1402,10 @@ int main(int argc, char **argv) {
     it.it_value = it.it_interval;
     setitimer(ITIMER_REAL, &it, NULL);
     while (!g_stop) {
-        /* A short poll timeout so the steady transmit tick runs on our own clock
-           even while the device is silent (see tx_send). */
-        int pr = poll(&pfd, 1, tx_period_ms());
+        /* Poll timeout: the active transmit period while the device is feeding
+           us, and the long dormant one when it is not (see idle_now), so an
+           idle headset costs a few wakeups a second instead of the full rate. */
+        int pr = poll(&pfd, 1, poll_ms());
         if (pr < 0) { if (errno == EINTR) continue; break; }
         if (pr > 0) {
             ssize_t n = read(fd, buf, sizeof(buf));
@@ -1379,10 +1425,10 @@ int main(int argc, char **argv) {
                         line[carry + seg] = '\0';
                         if (feed_line(line)) {
                             /* A real device event: everything below keys off it
-                               (transmit hold, stall detector, heartbeat). */
+                               (transmit hold, quiet detector, heartbeat). */
                             g_lastDataMs = now_ms();
                             g_evCount++;
-                            g_stallActive = 0;
+                            g_quietActive = 0;
                         }
                     }
                     carry = 0; start = (size_t)i + 1;
@@ -1394,31 +1440,41 @@ int main(int argc, char **argv) {
         }
         long long tnow = now_ms();
         g_loopTickMs = tnow;                 /* watchdog progress marker */
-        if (tnow - g_lastTxMs >= tx_period_ms()) tx_send();
+        if (tnow - g_lastTxMs >= tx_gap_ms()) tx_send();
 
         if (tnow >= nextHealth) {
             nextHealth = tnow + SOCK_POLL_MS;
-            health_check();
+            /* Tracefs maintenance. Re-arming, or re-enabling tracing, can make
+               the kernel synchronise RCU and sit on a tracefs write for far
+               longer than a loop tick, so tell the watchdog this is deliberate
+               and then mark progress ourselves. */
+            g_maint = 1;
+            int fixed = health_check();
             refresh_target();
-            /* Data stall. Armed probes and tracing_on can both look healthy while
-               no events arrive at all: normal before anything requests tracking,
-               but also what a reader-side loss looks like (another trace_pipe
-               consumer draining our events, or a reset buffer). We cannot tell
-               them apart from here, so re-arm -- once per stall, not once a
-               minute forever: idle is the normal state (nothing is tracking
-               whenever no app asks for it), and re_arm() clears every uprobe on
-               the box, so repeating it while idle would hammer tracefs and any
-               other consumer. g_stallActive is cleared by the next real event. */
+            g_loopTickMs = now_ms();
+            g_maint = 0;
+
+            /* Quiet, not stalled. Armed probes and tracing_on both look healthy
+               while no events arrive at all -- and that is the NORMAL state: with
+               no app asking for tracking, nothing calls the probed functions.
+               Silence alone therefore proves nothing, and 1.3.7 re-armed here
+               every time a quiet episode began, which meant clearing and rebuilding
+               every uprobe on the box each time a session ended, to fix a case it
+               could not fix anyway (a foreign trace_pipe consumer keeps draining
+               whatever we rebuild). The precise self-heal is health_check() just
+               above: it re-arms when our probe set or tracing_on really was changed
+               under us, and says so in the log. So report the episode instead of
+               churning tracefs. One line per episode; the next real event clears
+               g_quietActive. */
             long long idle = tnow - g_lastDataMs;
-            if (g_stateOk && g_evCount > 0 && idle > STALL_MS && !g_stallActive &&
-                tnow - g_lastRearmMs > STALL_REARM_MS) {
-                g_stallActive = 1;
-                g_lastRearmMs = tnow;
-                g_stallCount++;
+            if (g_stateOk && g_evCount > 0 && idle > QUIET_MS && !g_quietActive) {
+                g_quietActive = 1;
+                g_quietCount++;
                 fprintf(stderr, "gxr_alvr: no probe events for %lld ms (ev=%lld tx=%lld, "
-                                "stall #%d); re-arming all probes\n",
-                        idle, g_evCount, g_txCount, g_stallCount);
-                re_arm();
+                                "quiet episode #%d); tracefs %s\n",
+                        idle, g_evCount, g_txCount, g_quietCount,
+                        fixed ? "was unhealthy and has been re-armed"
+                              : "healthy, so this is idle rather than a fault");
             }
         }
 
@@ -1435,9 +1491,9 @@ int main(int argc, char **argv) {
             if (event_present("jaw")) probes++;
             if (event_present("tongue")) probes++;
             fprintf(stderr, "gxr_alvr: hb t=%lld ev=%lld tx=%lld idle=%lldms probes=%d/5 "
-                            "on=%d stalls=%d verbose=%d\n",
+                            "on=%d quiet=%d verbose=%d\n",
                     tnow, g_evCount, g_txCount, g_lastDataMs ? (tnow - g_lastDataMs) : -1,
-                    probes, tracing_enabled(), g_stallCount, g_verbose);
+                    probes, tracing_enabled(), g_quietCount, g_verbose);
             /* Bound the log: a verbose run writes roughly 14 MB an hour, and even
                the heartbeat alone grows without limit over a long run. Past the
                cap, verbose goes off and the heartbeat slows down, so the log

@@ -1,11 +1,13 @@
 #!/system/bin/sh
 # Helper for the module WebUI (webroot/index.html). The KernelSU Manager invokes
 # this as root. It validates its arguments, reads/writes the module's option
-# files, and can restart the relay. Output is machine-readable: one "key=value"
-# per line (the page parses it).
+# files, restarts / pauses / resumes the relay, and exports the logs. Output is
+# machine-readable: one "key=value" per line (the page parses it).
 MODDIR=${0%/*}
 [ -f "$MODDIR/module.prop" ] || MODDIR=/data/adb/modules/gxr-alvr
 LOG=/data/local/tmp/gxr_alvr.log
+PAUSED="$MODDIR/paused"
+TRACE=/sys/kernel/tracing
 
 readval() { [ -f "$MODDIR/$1" ] && cat "$MODDIR/$1" 2>/dev/null; }
 
@@ -16,6 +18,7 @@ case "$1" in
     echo "mirror=$(readval mirror)"
     echo "tongue=$(readval tongue)"
     echo "verbose=$([ -f "$MODDIR/verbose" ] && echo 1 || echo 0)"
+    echo "paused=$([ -f "$PAUSED" ] && echo 1 || echo 0)"
     dv=""
     if [ -f "$MODDIR/devopts" ]; then dv=$(sed 's/ /=/' "$MODDIR/devopts" | tr '\n' ';'); dv=${dv%;}; fi
     echo "devopts=$dv"
@@ -63,6 +66,55 @@ case "$1" in
     echo "ok=1"
     echo "pid=$(pidof gxr_alvr 2>/dev/null)"
     ;;
+  pause)
+    # Stop the supervisor first (killing the relay alone would just make it
+    # respawn), then let the relay exit on its own: SIGTERM makes it disable its
+    # probes and clear uprobe_events on the way out, so a paused module is
+    # genuinely not tracing anything. This is the honest A/B switch for
+    # "is the module making my headset hot": one tap, no reboot, no zip swap.
+    pkill -f "$MODDIR/supervise.sh --loop" 2>/dev/null
+    sleep 1
+    pkill -x gxr_alvr 2>/dev/null
+    sleep 1
+    if pidof gxr_alvr >/dev/null 2>&1; then
+      echo "error=relay did not stop (pid $(pidof gxr_alvr))"; exit 1
+    fi
+    # Cover the case where the relay had been killed from outside earlier, so
+    # nothing disarmed its probes: turn our tracing off explicitly.
+    echo 0 > "$TRACE/tracing_on" 2>/dev/null
+    echo 0 > "$TRACE/events/uprobes/pten/enable" 2>/dev/null
+    echo 0 > "$TRACE/events/uprobes/dir/enable" 2>/dev/null
+    echo 0 > "$TRACE/events/uprobes/bs/enable" 2>/dev/null
+    echo 0 > "$TRACE/events/uprobes/jaw/enable" 2>/dev/null
+    echo 0 > "$TRACE/events/uprobes/tongue/enable" 2>/dev/null
+    : > "$PAUSED"
+    echo "ok=1"
+    echo "paused=1"
+    ;;
+  resume)
+    rm -f "$PAUSED" 2>/dev/null
+    sh "$MODDIR/action.sh" >/dev/null 2>&1
+    sleep 1
+    echo "ok=1"
+    echo "paused=0"
+    echo "pid=$(pidof gxr_alvr 2>/dev/null)"
+    ;;
+  exportlog)
+    # Copy the logs where the user can reach them (Downloads on internal storage),
+    # overwriting the previous copy instead of piling up files. Uses `cat >` so it
+    # does not depend on cp being allowed to write to /sdcard.
+    DST=/sdcard/Download
+    mkdir -p "$DST" 2>/dev/null
+    n=0
+    for pair in "gxr-alvr-log.txt:$LOG" "gxr-alvr-log-previous.txt:$LOG.1" \
+                "gxr-alvr-install-log.txt:/data/local/tmp/gxr_alvr_install.log"; do
+      out="${pair%%:*}"; src="${pair#*:}"
+      if [ -f "$src" ]; then cat "$src" > "$DST/$out" 2>/dev/null && n=$((n + 1)); fi
+    done
+    echo "ok=$n"
+    echo "dir=$DST"
+    echo "files=$(ls -l "$DST"/gxr-alvr-log.txt "$DST"/gxr-alvr-log-previous.txt 2>/dev/null | awk '{print $5}' | tr '\n' ',')"
+    ;;
   test)
     # test <ip>  -> best-effort reachability check from the headset
     IP="$2"
@@ -74,7 +126,7 @@ case "$1" in
     fi
     ;;
   *)
-    echo "error=usage: status | set <pc|-|auto> <port> <tongue> <verbose> | setdev <spec|-> | test <ip>"
+    echo "error=usage: status | set <pc|-|auto> <port> <tongue> <verbose> | setdev <spec|-> | pause | resume | exportlog | test <ip>"
     exit 2
     ;;
 esac
