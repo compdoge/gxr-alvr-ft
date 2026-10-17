@@ -109,7 +109,14 @@ case "$1" in
     for pair in "gxr-alvr-log.txt:$LOG" "gxr-alvr-log-previous.txt:$LOG.1" \
                 "gxr-alvr-install-log.txt:/data/local/tmp/gxr_alvr_install.log"; do
       out="${pair%%:*}"; src="${pair#*:}"
-      if [ -f "$src" ]; then cat "$src" > "$DST/$out" 2>/dev/null && n=$((n + 1)); fi
+      if [ -f "$src" ]; then
+        cat "$src" > "$DST/$out" 2>/dev/null && {
+          # The WebUI runs as root with a restrictive umask: without this the copy
+          # lands root-only and cannot be read back over adb either.
+          chmod 666 "$DST/$out" 2>/dev/null
+          n=$((n + 1))
+        }
+      fi
     done
     echo "ok=$n"
     echo "dir=$DST"

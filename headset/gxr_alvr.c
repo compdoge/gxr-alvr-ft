@@ -61,7 +61,7 @@
 
 /* Reported in the startup log and by --version, so the running build is always
    identifiable (avoids "is the new binary actually live?" confusion). */
-#define GXR_VERSION "1.3.8"
+#define GXR_VERSION "1.3.9"
 
 #define TRACE "/sys/kernel/tracing"
 /* Per-CPU trace ring buffer. The probes fire about 330 times a second, which is
@@ -102,6 +102,22 @@ enum { UE_EyeSquintRight = 0, UE_EyeSquintLeft = 1, UE_EyeWideRight = 2, UE_EyeW
    indices (28/29) are not read directly here. */
 #define F_EYES_CLOSED_L 12
 #define F_EYES_CLOSED_R 13
+
+/* Wink fold. eyes_closed (face 12/13) is the RAW value, the input to the device's
+   own EyeWinkPostprocessor -- which folds the lid tightener into it before the
+   runtime ever sees it, and our uprobe reads it before that. Measured on a real
+   capture (2026-10-17, firmware I610UEU2AZF3): a deliberate one-eye wink tops out
+   at closed 0.53-0.66 while the other eye stays at 0.00-0.16, so openness floored
+   at ~0.35 and the avatar's lid never shut; a full blink in the same capture
+   reaches exactly 1.00. Blinks and squints show no left/right gap at all, so the
+   fold is gated on the wink SHAPE -- one eye clearly closing while the other stays
+   open, which is what the vendor postprocessor keys on. Applying it to both eyes
+   unconditionally (as the old code did) saturated squints at closed~0.8-0.9 and
+   made the lid snap shut, which is why the raw value was emitted instead.
+   WINK_GAP 0.35 sits above the 0.27 asymmetry a hard squint can show and well
+   under a real wink's 0.49-0.53. --wink-gap 0 disables the fold. */
+static float WINK_GAP = 0.35f;          /* one-eye closure gap that counts as a wink */
+static float WINK_MS = 200.0f;          /* time to drive a gated wink shut (ms) */
 
 /* EyeTail slot order == UnifiedExprTracking.EyeTail in the module */
 enum { T_Version = 0, T_LOpen, T_ROpen, T_LPupil, T_RPupil, T_MinDil, T_MaxDil,
@@ -679,6 +695,9 @@ static long long g_gazePupRingMs[2][GAZE_PUPIL_RING];
 static int g_gazePupIdx[2], g_gazePupN[2];
 static long long g_gazePupSampleMs;
 static float g_gazeRatio[2];    /* last computed d_e/base (-1 = pupil unavailable), for the log */
+/* wink fold: how far the currently-gated wink has been driven shut (per eye) */
+static float g_winkBoost[2];
+static long long g_winkMs;      /* last wink-fold step (ramp dt) */
 /* jaw neutral learning (see RootedLinkFTModule.UpdateJaw) */
 static float g_jawHist[JAW_HIST]; static int g_jawN, g_jawIdx; static float g_jawNeutral = 0.2f;
 static long long g_jawNeutralMs;
@@ -726,7 +745,33 @@ static int tx_period_ms(void) {
 #define IDLE_MS 1000                    /* no event for this long => dormant */
 #define IDLE_POLL_MS 100                /* dormant loop period (10 wakeups/s) */
 #define IDLE_TX_HZ 10                   /* dormant keepalive datagrams/s */
-static long long g_loopTickMs;          /* last main-loop progress (watchdog) */
+static volatile long long g_loopTickMs;  /* last main-loop progress (watchdog) */
+#define PRINT_SLOW_MS 1000              /* one log write longer than this is a stall */
+#define PRINT_SLOW_MAX 3                /* ...this many and verbose turns itself off */
+static long long g_printStartMs;        /* when the current log write started */
+static int g_printSlow;                 /* log writes that took too long */
+
+/* A completed log write counts as loop progress. A filesystem hiccup must not
+   look like a wedged relay: the watchdog would restart the relay, and restarting
+   writes the same log, so the tracking gap only gets longer. Writes that are
+   repeatedly that slow turn verbose off instead -- a tuning trace is not worth
+   stalling the sensor loop for. The marker stays stale while a write is actually
+   stuck, so a syscall that never returns still trips the watchdog. */
+static void print_done(void) {
+    long long now = now_ms();
+    long long d = g_printStartMs ? (now - g_printStartMs) : 0;
+    g_loopTickMs = now;
+    g_printStartMs = now;
+    if (d > PRINT_SLOW_MS && g_verbose) {
+        g_printSlow++;
+        fprintf(stderr, "gxr_alvr: log write took %lld ms (slow #%d)\n", d, g_printSlow);
+        if (g_printSlow >= PRINT_SLOW_MAX) {
+            g_verbose = 0;
+            fprintf(stderr, "gxr_alvr: verbose off (log writes are stalling)\n");
+            fflush(stderr);
+        }
+    }
+}
 static volatile sig_atomic_t g_maint;   /* a tracefs maintenance op is running */
 static long long g_evCount;             /* OUR probe events parsed */
 static long long g_txCount;             /* datagrams sent */
@@ -849,14 +894,34 @@ static void compute_and_send(void) {
         /* eyes_closed (face 12/13) is the raw value: the device folds the lid
            tightener into it later, in its own EyeWinkPostprocessor, and our uprobe
            reads it BEFORE that. Verified by RE: raw eyes_closed reaches exactly
-           1.0 on a full closure (results/eye-postprocessing-re.md). Folding the
-           squint in here as well saturated openness at closed~=0.8-0.9, which is
-           what made the lid snap shut over the last ~20%. Emit the raw openness;
-           the squint still travels as its own expression (FACE68_TO_UE maps face
-           28/29 -> UE_EyeSquint{Left,Right}). */
-        float closedL = g_face[F_EYES_CLOSED_L], closedR = g_face[F_EYES_CLOSED_R];
-        tail[T_LOpen] = 1.0f - clampf(closedL, 0.0f, 1.0f);
-        tail[T_ROpen] = 1.0f - clampf(closedR, 0.0f, 1.0f);
+           1.0 on a full closure (results/eye-postprocessing-re.md). So emit the raw
+           openness, and let the squint travel as its own expression (FACE68_TO_UE
+           maps face 28/29 -> UE_EyeSquint{Left,Right}) -- but restore the one
+           thing that fold was actually needed for: a deliberate wink, which the
+           raw value under-reports (see WINK_GAP). */
+        float closedL = clampf(g_face[F_EYES_CLOSED_L], 0.0f, 1.0f);
+        float closedR = clampf(g_face[F_EYES_CLOSED_R], 0.0f, 1.0f);
+        if (WINK_GAP > 0.0f) {
+            float dtms = (float)(now - g_winkMs); g_winkMs = now;
+            if (dtms <= 0.0f || dtms > 500.0f) dtms = 100.0f;   /* first frame, or after a gap */
+            float step = dtms / fmaxf(WINK_MS, 1.0f);
+            /* Gate on the wink SHAPE, using the raw pair before either is folded:
+               this eye closing while the other stays open. Both eyes closing (a
+               blink) or both narrowing (a squint) keep the gap near zero, so
+               nothing below fires for them -- which is what the old unconditional
+               fold got wrong. A ramp (not a step) means a sustained wink closes all
+               the way while a passing one-eye asymmetry only gets a partial fold. */
+            int gateL = (closedL - closedR) > WINK_GAP;
+            int gateR = (closedR - closedL) > WINK_GAP;
+            g_winkBoost[0] = gateL ? fminf(g_winkBoost[0] + step, 1.0f)
+                                   : fmaxf(g_winkBoost[0] - 2.0f * step, 0.0f);
+            g_winkBoost[1] = gateR ? fminf(g_winkBoost[1] + step, 1.0f)
+                                   : fmaxf(g_winkBoost[1] - 2.0f * step, 0.0f);
+            closedL += (1.0f - closedL) * g_winkBoost[0];
+            closedR += (1.0f - closedR) * g_winkBoost[1];
+        }
+        tail[T_LOpen] = 1.0f - closedL;
+        tail[T_ROpen] = 1.0f - closedR;
     }
 
     /* 3b) pupil: per eye, smoothed, with a drift-based fallback so a wink no
@@ -973,14 +1038,18 @@ static void compute_and_send(void) {
         static long long lastpup = 0;
         if (now - lastpup > PUPIL_LOG_MS) {
             lastpup = now;
+            g_printStartMs = now_ms();
             /* Per-detection dump: idx:d<mm>/c<conf>/x<centre-x>/a<age-ms>. The
-               diameter here is UNCLAMPED so junk is visible. */
-            fprintf(stderr, "gxr_alvr: pupil mm=%.2f nd=%d min=%.2f max=%.2f open=%.2f/%.2f eye=%d%d oc=%d%d raw=%.2f/%.2f s=%.2f/%.2f closed=%.2f/%.2f det=",
+               diameter here is UNCLAMPED so junk is visible. open= is the EMITTED
+               openness (so the wink fold shows up here), closed= the raw input,
+               wb= the wink-fold boost applied to it. */
+            fprintf(stderr, "gxr_alvr: pupil mm=%.2f nd=%d min=%.2f max=%.2f open=%.2f/%.2f eye=%d%d oc=%d%d raw=%.2f/%.2f s=%.2f/%.2f closed=%.2f/%.2f wb=%.2f/%.2f det=",
                     g_lastMm, nd, g_minMm, g_maxMm, tail[T_LOpen], tail[T_ROpen],
                     eyeOpen[0], eyeOpen[1], g_eyeOccl[0], g_eyeOccl[1],
                     raw[0], raw[1], g_eyeS[0], g_eyeS[1],
                     haveFace ? g_face[F_EYES_CLOSED_L] : -1.0f,
-                    haveFace ? g_face[F_EYES_CLOSED_R] : -1.0f);
+                    haveFace ? g_face[F_EYES_CLOSED_R] : -1.0f,
+                    g_winkBoost[0], g_winkBoost[1]);
             for (int i = 0; i < MAX_DET; i++) {
                 if (!g_det_ok[i]) continue;
                 float dd = 2.0f * fmaxf(g_det[i][2], g_det[i][3]) * PUPIL_MM_SCALE;
@@ -988,6 +1057,7 @@ static void compute_and_send(void) {
                         g_det[i][0], now - g_det_ms[i]);
             }
             fputc('\n', stderr);
+            print_done();
         }
     }
 
@@ -1100,6 +1170,7 @@ static void compute_and_send(void) {
         static long long lastlog = 0;
         if (g_verbose && now - lastlog >= GAZE_LOG_MS) {
             lastlog = now;
+            g_printStartMs = now_ms();
             float lx, ly, rx, ry;
             gaze_map(g_gazeOut[0], &lx, &ly); gaze_map(g_gazeOut[1], &rx, &ry);
             /* Fast per-eye trace. Ldir/Rdir are the RAW device vectors, Lg/Rg the
@@ -1114,6 +1185,7 @@ static void compute_and_send(void) {
                     g_Ldir[0], g_Ldir[1], g_Ldir[2],
                     g_Rdir[0], g_Rdir[1], g_Rdir[2],
                     lx, ly, rx, ry);
+            print_done();
         }
     }
 
@@ -1201,6 +1273,9 @@ static void usage(FILE *f, const char *argv0) {
         "  --pupil-min-conf <f> --pupil-open-gate <f> --pupil-max-jump <f>\n"
         "  --pupil-relock-ms <f>  forget an eye after this long with no reading (default 1500)\n"
         "  --pupil-smooth-ms <f>  per-eye low-pass time constant (default 350)\n"
+        "  --wink-gap <f>         one-eye closure gap that counts as a wink (default\n"
+        "                         0.35; 0 disables the wink fold)\n"
+        "  --wink-ms <f>          how long a gated wink takes to close fully (default 200)\n"
         "  --gaze-blink-shut <f>  openness below this is a shut lid (default 0.15)\n"
         "  --gaze-pitch-guard <f> deg; do not read a shut lid as a blink while looking\n"
         "                         down past this pitch (default -20, model-specific)\n"
@@ -1254,6 +1329,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--selftest")) selftest = 1;
         else if (!strcmp(argv[i], "--verbose")) g_verbose = 1;
+        else if (!strcmp(argv[i], "--wink-gap") && i + 1 < argc) WINK_GAP = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--wink-ms") && i + 1 < argc) WINK_MS = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--gaze-swap") && i + 1 < argc) g_swap = atoi(argv[++i]) ? 1 : 0;
         else if (!strcmp(argv[i], "--gaze-invert-x") && i + 1 < argc) g_inv_x = atoi(argv[++i]) ? 1 : 0;
         else if (!strcmp(argv[i], "--gaze-invert-y") && i + 1 < argc) g_inv_y = atoi(argv[++i]) ? 1 : 0;
@@ -1293,6 +1370,13 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "gxr_alvr: unknown arg: %s\n", argv[i]); usage(stderr, argv[0]); return 2; }
     }
 
+    /* While verbose is on, batch the tuning trace instead of one write per line:
+       the trace is ~20 lines/s, and every write is a chance to sit in filesystem
+       writeback. Full buffering is only safe because the heartbeat (the liveness
+       proof) and the armed line force a flush. */
+    static char vbuf[8192];
+    if (g_verbose) setvbuf(stderr, vbuf, _IOFBF, sizeof(vbuf));
+
     struct sigaction sa; memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_sig; sigemptyset(&sa.sa_mask); sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL); sigaction(SIGTERM, &sa, NULL);
@@ -1302,6 +1386,14 @@ int main(int argc, char **argv) {
     /* SO_BROADCAST is required for auto mode and harmless for unicast. */
     int bcast = 1;
     setsockopt(g_sock, SOL_SOCKET, SO_BROADCAST, &bcast, sizeof(bcast));
+    /* Non-blocking transmit. A blocking UDP sendto parks when the socket's send
+       buffer fills, which is what a Wi-Fi hiccup, a roaming AP or a busy driver
+       does -- and a parked transmit tick takes the whole loop with it (a measured
+       40+ s main-loop stall that the watchdog then turns into a relay restart,
+       which only makes the gap longer because the restart writes the same log and
+       re-arms the same probes). At 60 datagrams/s, dropping one is invisible. */
+    if (fcntl(g_sock, F_SETFL, fcntl(g_sock, F_GETFL, 0) | O_NONBLOCK) != 0)
+        fprintf(stderr, "gxr_alvr: socket set non-blocking failed: %s\n", strerror(errno));
     g_sa_port = htons((uint16_t)port);
 
     char target[256];
@@ -1378,6 +1470,12 @@ int main(int argc, char **argv) {
     fprintf(stderr, "gxr_alvr: v%s armed pten@0x%lx + eyedir@0x%lx + face68@0x%lx + jaw@0x%lx + tongue@0x%lx -> %s:%d (UniExpr)%s\n",
             GXR_VERSION, pupil_off, eyedir_off, face_off, jaw_off, tongue_off, target, port,
             g_have_mirror ? " +mirror" : "");
+    if (WINK_GAP > 0.0f)
+        fprintf(stderr, "gxr_alvr: wink fold on (gap %.2f, %d ms ramp); --wink-gap 0 disables it\n",
+                (double)WINK_GAP, (int)WINK_MS);
+    /* The armed line is how "is the new binary live?" gets answered, so it has to
+       reach the log now, before anything else can buffer it. */
+    fflush(stderr);
 
     /* O_NONBLOCK matters: trace_pipe is a CONSUMING read, so a poll() that said
        "readable" can still find nothing for us. A blocking read here once parked
@@ -1394,6 +1492,7 @@ int main(int argc, char **argv) {
     long long nextHb = now_ms() + HB_MS;
     /* Arm the watchdog now that nothing else can delay us before the loop. */
     g_loopTickMs = now_ms();
+    g_printStartMs = g_loopTickMs;
     struct sigaction sw; memset(&sw, 0, sizeof(sw));
     sw.sa_handler = on_alarm; sigemptyset(&sw.sa_mask); sw.sa_flags = 0;
     sigaction(SIGALRM, &sw, NULL);
@@ -1490,10 +1589,15 @@ int main(int argc, char **argv) {
             if (event_present("bs")) probes++;
             if (event_present("jaw")) probes++;
             if (event_present("tongue")) probes++;
+            g_printStartMs = now_ms();
             fprintf(stderr, "gxr_alvr: hb t=%lld ev=%lld tx=%lld idle=%lldms probes=%d/5 "
                             "on=%d quiet=%d verbose=%d\n",
                     tnow, g_evCount, g_txCount, g_lastDataMs ? (tnow - g_lastDataMs) : -1,
                     probes, tracing_enabled(), g_quietCount, g_verbose);
+            print_done();
+            /* The heartbeat is the liveness proof, so it must reach the log now --
+               even if stderr is buffered (it is, while verbose is on). */
+            fflush(stderr);
             /* Bound the log: a verbose run writes roughly 14 MB an hour, and even
                the heartbeat alone grows without limit over a long run. Past the
                cap, verbose goes off and the heartbeat slows down, so the log

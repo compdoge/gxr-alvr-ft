@@ -90,6 +90,13 @@ pidof gxr_alvr >/dev/null 2>&1 && { pkill -9 -x gxr_alvr 2>/dev/null; sleep 1; }
 
 # ---- fresh log per start; the previous run is kept as .1 for diagnosis ----
 [ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
+# Keep the log readable by a non-root adb shell. The Manager's WebUI runs
+# service.sh/action.sh as root with a restrictive umask, so the file the shell
+# redirect below creates would otherwise come out root-only (0600) and could not
+# be pulled for diagnosis - while a boot-time start would have produced 0666.
+# Create it here with the mode everyone expects, before the redirect appends.
+: >> "$LOG" 2>/dev/null
+chmod 666 "$LOG" 2>/dev/null
 
 # ---- start (EXTRA is a validated flag list, so word-splitting it is intended) ----
 set -- "$BIN" --port "$PORT"

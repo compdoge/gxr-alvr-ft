@@ -301,6 +301,8 @@ var DEVOPTS = [
   { f:"--pupil-dilation-gain", d:"0.75", k:"num", t:"Widens the dilation window by 1/gain. Raise toward 1.0 for a wider, more sensitive dilation range." },
   { f:"--pupil-smooth-ms", d:"350", k:"num", t:"Per-eye low-pass time constant. Higher = steadier but slower to follow." },
   { f:"--pupil-min-conf", d:"0.25", k:"num", t:"Ignore pupil detections whose confidence is below this." },
+  { f:"--wink-gap", d:"0.35", k:"num", t:"Left/right difference in eyes_closed that counts as a wink: the closing eyelid is then driven fully shut, which the raw sensor value under-reports. 0 disables it. Raise it if a wink is missed; lower it if a partial one-eye closure snaps shut." },
+  { f:"--wink-ms", d:"200", k:"num", t:"How long a detected wink takes to close fully, in ms. Lower is snappier, higher is softer." },
   { f:"--tx-hz", d:"60", k:"num", t:"Datagrams per second. Lower it if this stream disturbs Wi-Fi trackers or streaming on your LAN (broadcast is the expensive kind of traffic). A pinned PC IP does not need this." },
   { f:"--gaze-lid-low", d:"0.70", k:"num", t:"An eyelid below this openness counts as narrowed; the gaze is then only trusted while the pupil still looks normal. This is what stops squints shaking the gaze without freezing it when you look down." },
   { f:"--gaze-pupil-ratio", d:"0.55", k:"num", t:"A pupil below this fraction of the eye's own recent size counts as covered by the lid. Lower = trusts the gaze more; higher = freezes it sooner." },

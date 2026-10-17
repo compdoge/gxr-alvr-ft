@@ -53,9 +53,10 @@ new version. The WebUI's *Save & restart* does that for you.
 ## Developer options (WebUI)
 
 The WebUI's **Developer options** card exposes the sender's tuning knobs, each
-with a one-line description - the datagram rate (`--tx-hz`), the mirror port,
-TongueRoll gain, the dilation keys (`--pupil-dilation-gain`, `--pupil-smooth-ms`,
-`--pupil-min-conf`) and the gaze keys. The gaze keys decide when an eye's
+with a one-line description - the datagram rate (`--tx-hz`), the wink fold
+(`--wink-gap`, `--wink-ms`), the mirror port, TongueRoll gain, the dilation keys
+(`--pupil-dilation-gain`, `--pupil-smooth-ms`, `--pupil-min-conf`) and the gaze
+keys. The gaze keys decide when an eye's
 direction is *trustworthy*: a pitch-guarded blink test plus a pupil test relative
 to that eye's own recent size (`--gaze-lid-low`, `--gaze-pupil-ratio`), a
 smoothing-only band for a narrowed lid that the pupil test cannot see
@@ -66,6 +67,21 @@ A nested **Advanced - firmware probes** section holds the firmware-specific upro
 offsets and plugin paths. They exist so the module can track a firmware change
 without a rebuild, but a wrong value stops face/eye tracking entirely - leave them
 alone unless you know your firmware differs.
+
+### The wink fold (`--wink-gap`)
+
+The device reports `eyes_closed` per eye, but it folds the lid tightener in
+afterwards in its own wink postprocessor - and the module reads the value before
+that. Measured on this firmware, a deliberate wink therefore tops out around 0.6
+(openness ~0.4) while a blink reaches 1.0, so a wink used to leave the avatar's
+eyelid partly open.
+
+The sender restores it: when one eye is clearly closing while the other stays open
+(that gap is the `--wink-gap`, default 0.35), it drives that eyelid shut over
+`--wink-ms` (default 200). Both eyes closing (a blink) or both narrowing (a
+squint) show no left/right gap, so nothing is folded for them - which is what makes
+this different from the old unconditional fold that used to saturate squints.
+`--wink-gap 0` disables the fold.
 
 A field left at its default is omitted, so future default changes still reach you;
 **Reset to defaults** clears the file. PC IP, UDP port, TongueRoll and Verbose have
@@ -157,9 +173,15 @@ our probe set or `tracing_on` really was changed under us. It is deliberately no
 triggered by idleness: re-arming clears every uprobe on the device, and it could
 not fix the one case it cannot see (a foreign `trace_pipe` consumer) anyway.
 
-`verbose` adds the tuning trace (~20 Hz gaze, 4 Hz pupil). Past 4 MB in a single
-run, verbose switches itself off and the heartbeat slows to every 5 minutes, so a
-long run cannot grow the log without bound.
+`verbose` adds the tuning trace (~20 Hz gaze, 4 Hz pupil). Its lines carry what a
+field capture needs to explain an eye: `open=` is the EMITTED openness (so the
+wink fold is visible), `closed=` the raw sensor value and `wb=` the wink-fold
+boost applied to it, `held=` the gaze trust gate and `pu=` the pupil size relative
+to that eye's own baseline. The trace is batch-written and flushed at least on
+every heartbeat; past 4 MB in a single run, verbose switches itself off and the
+heartbeat slows to every 5 minutes, so a long run cannot grow the log without
+bound. If single log writes start taking more than a second - a busy filesystem -
+verbose turns itself off rather than stall the sensor loop, and says so in the log.
 
 ## Load (what it costs the headset)
 
@@ -185,6 +207,11 @@ session - which was sized for an old blocking-read stall that no longer exists.
   fails soft per probe if the firmware changes.
 - The relay refuses to start a second copy (flock at
   `/data/local/tmp/gxr_alvr.lock`) and self-heals if tracefs is cleared under it.
+- The relay never blocks on I/O: `trace_pipe` is read non-blocking, and the UDP
+  socket is non-blocking too, so a full send buffer or a Wi-Fi hiccup drops a
+  datagram instead of parking the loop. A completed log write also counts as loop
+  progress, so a filesystem stall is not mistaken for a wedged relay - restarting
+  would just write the same log again and make the tracking gap longer.
 - `service.sh`/`action.sh` run the relay under `supervise.sh`, which restarts it
   if it exits (a crash, or the sender's own watchdog). So `pkill -x gxr_alvr` on
   its own no longer stops the relay -- it comes straight back. Stop the
